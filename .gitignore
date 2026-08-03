@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+backend/document_storage/
+backend/report_storage/
+*.log
+qdrant-bin/
+storage/
+snapshots/
+.qdrant-initialized
+.claude/settings.local.json

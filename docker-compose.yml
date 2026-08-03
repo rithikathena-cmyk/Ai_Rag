@@ -1,0 +1,97 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:6333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ragchat-net
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ragchat-net
+
+  backend:
+    build: ./backend
+    ports:
+      - "${BACKEND_PORT}:8000"
+    env_file:
+      - .env
+    environment:
+      # .env holds native-run (localhost) defaults; override to the
+      # docker-compose service name so container-to-container calls work.
+      QDRANT_HOST: qdrant
+      POSTGRES_HOST: postgres
+    volumes:
+      - ./backend/app:/app/app
+      - document_storage:/app/document_storage
+      - report_storage:/app/report_storage
+      - docling_cache:/root/.cache/huggingface
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ragchat-net
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "${FRONTEND_PORT}:8501"
+    env_file:
+      - .env
+    environment:
+      # .env holds native-run (localhost) defaults; override to the
+      # docker-compose service name so container-to-container calls work.
+      BACKEND_URL: http://backend:8000
+    volumes:
+      - ./frontend/app:/app/app
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ragchat-net
+
+networks:
+  ragchat-net:
+    driver: bridge
+
+volumes:
+  qdrant_data:
+  postgres_data:
+  document_storage:
+  report_storage:
+  docling_cache:

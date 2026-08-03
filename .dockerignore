@@ -1,0 +1,7 @@
+.venv/
+**/__pycache__/
+**/*.pyc
+document_storage/
+backend/document_storage/
+backend/report_storage/
+.env
