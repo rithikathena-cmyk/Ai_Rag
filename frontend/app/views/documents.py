@@ -25,7 +25,7 @@ _can_delete = has_permission(_capabilities, DELETE_DOCUMENTS)
 _can_manage = has_permission(_capabilities, MANAGE_DOCUMENTS)
 
 page_header(
-    "Documents", "📄",
+    "Documents", "document",
     "Browse and inspect ingestion pipeline results." if not _can_upload
     else "Upload, browse, and inspect ingestion pipeline results.",
     color="blue-green-70",
@@ -201,7 +201,7 @@ with tab_detail:
             btn_col1, btn_col2 = st.columns(2)
             # Reindex was previously ungated in the UI (and on the backend —
             # see routers/documents.py's now-added MANAGE_DOCUMENTS check).
-            if _can_manage and btn_col1.button("🔁 Reindex (re-embed chunks)"):
+            if _can_manage and btn_col1.button("Reindex (re-embed chunks)"):
                 try:
                     with st.spinner("Re-embedding…"):
                         api_client.reindex_document(doc_id)
@@ -209,7 +209,7 @@ with tab_detail:
                     st.rerun()
                 except APIError as exc:
                     show_api_error(exc)
-            if _can_delete and btn_col2.button("🗑️ Delete document", type="secondary"):
+            if _can_delete and btn_col2.button("Delete document", type="secondary"):
                 try:
                     api_client.delete_document(doc_id)
                     st.session_state.selected_document_id = None

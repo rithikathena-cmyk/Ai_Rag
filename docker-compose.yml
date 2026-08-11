@@ -2,7 +2,17 @@ services:
   postgres:
     image: postgres:16-alpine
     ports:
-      - "5432:5432"
+      # Loopback-only: reachable from this machine for local psql/debugging,
+      # never from the LAN or the internet. The Cloudflare Tunnel only ever
+      # forwards to the backend service below, never to this port.
+      #
+      # Host side is a separate, configurable port (POSTGRES_HOST_PORT) so
+      # this container coexists with a native Postgres already bound to
+      # 5432 on this machine — the container side must stay 5432 unchanged
+      # (that's the image's fixed internal listening port, and it's what
+      # POSTGRES_PORT/postgres:5432 below actually reach over the internal
+      # Docker network, independent of whatever host port is published here).
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     env_file:
       - .env
     environment:
@@ -19,20 +29,33 @@ services:
     networks:
       - ragchat-net
 
+  qdrant:
+    image: qdrant/qdrant:v1.11.0
+    ports:
+      # Loopback-only, same rationale as postgres above — lets you open the
+      # Qdrant dashboard at http://localhost:6333/dashboard from this
+      # machine without exposing it beyond it.
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    networks:
+      - ragchat-net
+
   backend:
     build: ./backend
     ports:
-      - "${BACKEND_PORT}:8000"
+      # Loopback-only: cloudflared (running natively on this Windows host,
+      # not in a container) reaches the backend via 127.0.0.1:${BACKEND_PORT}
+      # and is the only path in from the public internet. Binding to 0.0.0.0
+      # here would also expose the API directly on the LAN/router.
+      - "127.0.0.1:${BACKEND_PORT}:8000"
     env_file:
       - .env
     environment:
-      # Qdrant runs natively on the host (see start-qdrant.ps1), not in a
-      # container, so reach it via Docker Desktop's host gateway rather than
-      # a compose service name.
-      QDRANT_HOST: host.docker.internal
+      # Both backing stores are now compose services reachable by name on
+      # ragchat-net — no host-native Qdrant, no host.docker.internal needed.
+      QDRANT_HOST: qdrant
       POSTGRES_HOST: postgres
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - ./backend/app:/app/app
       - document_storage:/app/document_storage
@@ -41,34 +64,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - ragchat-net
-
-  frontend:
-    build: ./frontend
-    ports:
-      - "${FRONTEND_PORT}:8501"
-    env_file:
-      - .env
-    environment:
-      # .env holds native-run (localhost) defaults; override to the
-      # docker-compose service name so container-to-container calls work.
-      BACKEND_URL: http://backend:8000
-    volumes:
-      - ./frontend/app:/app/app
-    depends_on:
-      backend:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      # Cold start downloads BGE-M3 + reranker + spaCy into the fresh
+      # docling_cache volume (several GB, unauthenticated HF Hub) before the
+      # port even opens — without this, the default 50s grace (interval x
+      # retries) marks it unhealthy well before that finishes. Cached after
+      # the first run, so later restarts are fast regardless.
+      start_period: 600s
     networks:
       - ragchat-net
 
@@ -78,6 +86,7 @@ networks:
 
 volumes:
   postgres_data:
+  qdrant_storage:
   document_storage:
   report_storage:
   docling_cache:

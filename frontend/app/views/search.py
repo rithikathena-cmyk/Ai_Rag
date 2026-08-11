@@ -4,7 +4,7 @@ import api_client
 from api_client import APIError
 from components import card, debug_json, page_header, show_api_error
 
-page_header("Search", "🔎", "Hybrid dense + BM25 retrieval over your knowledge base.", color="violet-70")
+page_header("Search", "search", "Hybrid dense + BM25 retrieval over your knowledge base.", color="violet-70")
 
 # /search is LLM-RBAC-governed the same way /chat is (docs/LLM_RBAC_ARCHITECTURE.md).
 if not st.session_state.get("current_user"):

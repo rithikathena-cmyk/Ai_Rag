@@ -1,10 +1,9 @@
 import streamlit as st
 from streamlit_extras.add_vertical_space import add_vertical_space
-from streamlit_extras.annotated_text import annotated_text
 
 import api_client
 from api_client import APIError
-from components import card, metric_cards, page_header, render_capabilities, role_tag, show_api_error, status_badge
+from components import card, metric_cards, page_header, render_capabilities, role_label, show_api_error, status_badge
 
 if not st.session_state.get("current_user"):
     st.warning("Log in to view your dashboard — see the Login page.")
@@ -20,7 +19,7 @@ _display_name = (_user.get("display_name") or _user["email"].split("@")[0]).titl
 _is_employee = _user["role"] == "user"
 
 page_header(
-    "Dashboard", "🏠",
+    "Dashboard", "home",
     f"Welcome back, {_display_name} — here's what's happening in your knowledge base.",
     color="blue",
 )
@@ -53,30 +52,9 @@ else:
     metric_cols[2].metric("Reports generated", report_result["total"] if report_result else "—")
 metric_cards()
 
-st.markdown("##### Quick actions")
-action_cols = st.columns(1 if _is_employee else 4)
-if action_cols[0].button("💬 Start a chat", type="primary", use_container_width=True):
-    st.switch_page("views/chat.py")
-if not _is_employee:
-    if action_cols[1].button("📄 Browse documents", use_container_width=True):
-        st.switch_page("views/documents.py")
-    if action_cols[2].button("🔎 Search knowledge base", use_container_width=True):
-        st.switch_page("views/search.py")
-    if action_cols[3].button("📊 View reports", use_container_width=True):
-        st.switch_page("views/reports.py")
-
-add_vertical_space(1)
-st.markdown("##### What you can do")
-annotated_text("Role: ", role_tag(_user["role"]))
-
-caps_result, caps_err = _safe(api_client.get_my_capabilities)
-if caps_err:
-    show_api_error(caps_err)
-elif caps_result:
-    render_capabilities(caps_result)
-
-add_vertical_space(1)
-st.markdown("##### Your usage")
+# Usage tiles render right under the row above (not after "Quick actions"/
+# "What you can do") so every tile on the page groups together at the top,
+# instead of the numeric summary being split by a wall of text in between.
 st.caption("Chat/search quotas reset daily and monthly.")
 
 usage_result, usage_err = _safe(api_client.get_my_usage)
@@ -115,6 +93,29 @@ elif usage_result:
     rpm_label = f"{rpm} req/min" if rpm is not None else "unlimited"
     concurrent_label = str(concurrent) if concurrent is not None else "unlimited"
     st.caption(f"Rate limit: {rpm_label} · Max concurrent requests: {concurrent_label}")
+
+add_vertical_space(1)
+st.markdown("##### Quick actions")
+action_cols = st.columns(1 if _is_employee else 4)
+if action_cols[0].button("Start a chat", type="primary", use_container_width=True):
+    st.switch_page("views/chat.py")
+if not _is_employee:
+    if action_cols[1].button("Browse documents", use_container_width=True):
+        st.switch_page("views/documents.py")
+    if action_cols[2].button("Search knowledge base", use_container_width=True):
+        st.switch_page("views/search.py")
+    if action_cols[3].button("View reports", use_container_width=True):
+        st.switch_page("views/reports.py")
+
+add_vertical_space(1)
+st.markdown("##### What you can do")
+st.markdown(f"**Role:** {role_label(_user['role'])}")
+
+caps_result, caps_err = _safe(api_client.get_my_capabilities)
+if caps_err:
+    show_api_error(caps_err)
+elif caps_result:
+    render_capabilities(caps_result)
 
 add_vertical_space(1)
 

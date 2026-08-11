@@ -4,7 +4,7 @@ import api_client
 from api_client import APIError
 from components import card, debug_json, explorable_table, metric_cards, page_header, show_api_error
 
-page_header("Evaluation", "🧪", "Retrieval and generation quality, tracked over time.", color="green-70")
+page_header("Evaluation", "science", "Retrieval and generation quality, tracked over time.", color="green-70")
 metric_cards()
 
 tab_queries, tab_runs, tab_summary, tab_experiments = st.tabs(["Eval queries", "Runs", "Summary", "Experiments"])

@@ -7,7 +7,7 @@ from permissions import (
     SYSTEM_SETTINGS, VIEW_ANALYTICS, VIEW_AUDIT_LOGS, VIEW_DOCUMENTS, VIEW_ROLES, VIEW_USERS, has_permission,
 )
 
-st.set_page_config(page_title="RAG Platform", page_icon="📚", layout="wide")
+st.set_page_config(page_title="RAG Platform", page_icon=":material/auto_awesome:", layout="wide")
 inject_global_styles()
 
 _user = st.session_state.get("current_user")
@@ -34,7 +34,7 @@ if _user:
 # just from what llm_rbac.yaml's rbac_permissions grants it (brief §10).
 pages = {
     "Account": [
-        st.Page("views/login.py", title="Login", icon="🔐"),
+        st.Page("views/login.py", title="Login", icon=":material/lock:"),
     ],
 }
 
@@ -46,19 +46,19 @@ if _user:
     # Documents/Search/Reports/Analytics/Administration nav for them at all;
     # the backend enforces the same line, not just this nav check (every
     # GET /documents* route now requires VIEW_DOCUMENTS too).
-    pages["Overview"] = [st.Page("views/dashboard.py", title="Dashboard", icon="🏠")]
-    pages["Assistant"] = [st.Page("views/chat.py", title="Chat", icon="💬")]
+    pages["Overview"] = [st.Page("views/dashboard.py", title="Dashboard", icon=":material/home:")]
+    pages["Assistant"] = [st.Page("views/chat.py", title="Chat", icon=":material/chat_bubble_outline:")]
 
     if has_permission(_capabilities, VIEW_DOCUMENTS):
-        pages["Knowledge base"] = [st.Page("views/documents.py", title="Documents", icon="📄")]
+        pages["Knowledge base"] = [st.Page("views/documents.py", title="Documents", icon=":material/description:")]
 
     # Search/Reports aren't in the 12-permission catalog either — mapped to
     # VIEW_ANALYTICS (HR/PM/CEO/Admin per the matrix, not Employee), matching
     # today's exact "not Employee" behavior while now being permission-driven.
     if has_permission(_capabilities, VIEW_ANALYTICS):
-        pages.setdefault("Knowledge base", []).append(st.Page("views/search.py", title="Search", icon="🔎"))
-        pages["Outputs"] = [st.Page("views/reports.py", title="Reports", icon="📊")]
-        pages["Analytics"] = [st.Page("views/metrics.py", title="Query Metrics", icon="📈")]
+        pages.setdefault("Knowledge base", []).append(st.Page("views/search.py", title="Search", icon=":material/search:"))
+        pages["Outputs"] = [st.Page("views/reports.py", title="Reports", icon=":material/bar_chart:")]
+        pages["Analytics"] = [st.Page("views/metrics.py", title="Query Metrics", icon=":material/monitoring:")]
 
     # Users/Audit Logs — VIEW_USERS and VIEW_AUDIT_LOGS have been part of the
     # permission catalog since the RBAC pass (granted to HR/PM/CEO/Admin and
@@ -68,15 +68,15 @@ if _user:
     # on the separate MANAGE_USERS permission — see views/users.py) so this
     # sidebar redesign's per-role nav isn't linking to pages that don't exist.
     if has_permission(_capabilities, VIEW_USERS):
-        pages.setdefault("Administration", []).append(st.Page("views/users.py", title="Users", icon="👥"))
+        pages.setdefault("Administration", []).append(st.Page("views/users.py", title="Users", icon=":material/group:"))
 
     if has_permission(_capabilities, VIEW_ROLES):
         pages.setdefault("Administration", []).append(
-            st.Page("views/roles.py", title="Roles & Permissions", icon="🗂️")
+            st.Page("views/roles.py", title="Roles & Permissions", icon=":material/shield_person:")
         )
 
     if has_permission(_capabilities, VIEW_AUDIT_LOGS):
-        pages.setdefault("Administration", []).append(st.Page("views/audit_logs.py", title="Audit Logs", icon="🧾"))
+        pages.setdefault("Administration", []).append(st.Page("views/audit_logs.py", title="Audit Logs", icon=":material/receipt_long:"))
 
     if has_permission(_capabilities, SYSTEM_SETTINGS):
         # views/admin.py mixes real system-config UI (Qdrant collections,
@@ -86,14 +86,14 @@ if _user:
         # System-Settings-gated (Admin-only) rather than also opening it to
         # CEO for just its analytics tabs (CEO's analytics access is the
         # Query Metrics page above, same as HR/PM).
-        pages.setdefault("Administration", []).append(st.Page("views/admin.py", title="System Settings", icon="🛠️"))
+        pages.setdefault("Administration", []).append(st.Page("views/admin.py", title="System Settings", icon=":material/tune:"))
 
     # Evaluation is cost-sensitive (real LLM calls) and genuinely role-based
     # on the backend (require_role(ADMIN, CEO), not a coarse permission) —
     # mirrored here as a role check rather than forcing it into the
     # permission catalog it doesn't belong in.
     if _role in ("admin", "ceo"):
-        pages.setdefault("Administration", []).append(st.Page("views/evaluation.py", title="Evaluation", icon="🧪"))
+        pages.setdefault("Administration", []).append(st.Page("views/evaluation.py", title="Evaluation", icon=":material/science:"))
 
 if st.session_state.pop("_redirect_after_login", False) and "Overview" in pages:
     # Pass the actual StreamlitPage object just built into `pages`, not a
@@ -121,7 +121,7 @@ with st.sidebar:
         # block, invisible everywhere else). Every logged-in role gets
         # VIEW_CONVERSATIONS (llm_rbac.yaml), so no extra permission check
         # is needed here beyond being logged in.
-        if st.button("＋  New chat", use_container_width=True):
+        if st.button("New chat", use_container_width=True):
             st.session_state.conversation_id = None
             st.session_state.chat_messages = []
             st.switch_page("views/chat.py")
@@ -181,7 +181,13 @@ with st.sidebar:
                 continue
             sidebar_section_label(section)
             for p in section_pages:
-                st.page_link(p)
+                # st.page_link() does NOT inherit the icon from the
+                # st.Page object automatically (verified against this
+                # Streamlit version's source — icon stays None unless
+                # passed explicitly here), even though that same icon
+                # does drive Streamlit's own auto-generated nav (which
+                # this app hides via position="hidden" above).
+                st.page_link(p, icon=p.icon)
 
         # Settings — the brief's mockup places a single "⚙ Settings" entry
         # between nav and the profile row; these two controls (top-k,
@@ -191,7 +197,7 @@ with st.sidebar:
         # mockup's persistent Settings slot. A popover's body — like an
         # expander's — always runs every rerun regardless of open/closed
         # state, so these keys are set on every page load exactly as before.
-        with st.popover("⚙️  Settings", use_container_width=True):
+        with st.popover("Settings", use_container_width=True):
             st.slider(
                 "Top K sources", 1, 20, 5, key="chat_top_k",
                 help="How many document chunks the chat assistant retrieves per search. Higher can improve recall on broad questions; lower keeps answers tighter and faster.",

@@ -7,9 +7,7 @@ look automatically through page_header()/card()/status_badge()."""
 
 import pandas as pd
 import streamlit as st
-from streamlit_extras.annotated_text import annotated_text
 from streamlit_extras.dataframe_explorer import dataframe_explorer
-from streamlit_extras.metric_cards import style_metric_cards
 from streamlit_extras.stylable_container import stylable_container
 
 from api_client import APIError
@@ -19,15 +17,15 @@ from api_client import APIError
 # implements. PRIMARY is the one accent color used sparingly (buttons,
 # focus rings, active nav) rather than per-section branding.
 
-BG = "#F7F5F2"
-BG_SECONDARY = "#EFEDE8"
+BG = "#FFFFFF"
+BG_SECONDARY = "#FAFAF9"
 SURFACE = "#FFFFFF"
 INK = "#242322"
 MUTED = "#6F6B66"
-BORDER = "#DEDAD4"
+BORDER = "#E7E5E2"
 PRIMARY = "#D97757"
 PRIMARY_HOVER = "#C96849"
-USER_MSG_BG = "#EFEDE8"
+USER_MSG_BG = "#F4F4F3"
 ASSISTANT_MSG_BG = "#FFFFFF"
 
 # Section accents used by page_header()'s icon chip — kept muted/desaturated
@@ -51,16 +49,32 @@ _LEGACY_COLOR_MAP = {
     "light-blue-70": "cyan",
 }
 
-# Role display names/colors for role_tag() — only the five roles the
-# enterprise permission model actually distinguishes between (llm_rbac.yaml)
-# get a specific color; anything else (the inert manufacturing Role values —
-# see backend/app/core/roles.py) falls back to a neutral tag rather than
-# growing this list to match.
-_ROLE_LABELS = {"admin": "Admin", "hr": "HR", "project_manager": "Project Manager", "user": "Employee", "ceo": "CEO"}
-_ROLE_COLORS = {
-    "admin": ACCENTS["red"], "hr": ACCENTS["violet"], "project_manager": ACCENTS["teal"], "user": ACCENTS["blue"],
-    "ceo": ACCENTS["orange"],
+# Minimal monoline icons for page_header()'s chip — stroke="currentColor" so
+# each one picks up the chip's own accent color for free. Replaces the old
+# per-page emoji (🏠📄🔎 etc.), which read as colorful/playful rather than
+# the quiet, single-color icon language claude.ai actually uses. Call sites
+# pass a key from this dict; page_header() falls back to treating the string
+# as raw HTML (so a stray emoji still renders) if the key isn't found here.
+_PAGE_ICONS = {
+    "home": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11 L12 4 L21 11"/><path d="M5.5 9.5 V20 H18.5 V9.5"/><path d="M10 20 V14 H14 V20"/></svg>',
+    "chat": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5 H20 V16 H9 L5 19.5 V16 H4 Z"/></svg>',
+    "document": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3 H14 L18.5 7.5 V21 H6.5 Z"/><path d="M14 3 V7.5 H18.5"/><path d="M9 12.5 H16 M9 16 H16"/></svg>',
+    "search": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 L21 21"/></svg>',
+    "bar_chart": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 20 V13 M12 20 V6 M19 20 V10"/></svg>',
+    "monitoring": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 17 L9 10.5 L13 14 L20.5 5.5"/><path d="M15 5.5 H20.5 V11"/></svg>',
+    "group": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3"/><path d="M3 20 C3 15.5 5.5 13.5 9 13.5 C12.5 13.5 15 15.5 15 20"/><circle cx="17" cy="9" r="2.3"/><path d="M15.5 13.6 C18.6 13.9 21 15.8 21 20"/></svg>',
+    "shield": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 L19.5 6 V11.5 C19.5 16.5 16.3 19.8 12 21.5 C7.7 19.8 4.5 16.5 4.5 11.5 V6 Z"/><path d="M9 12 L11 14 L15.5 9.5"/></svg>',
+    "receipt": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3 H18 V21 L15.5 19 L13 21 L10.5 19 L8 21 L5.5 19 V3 Z" transform="translate(0.5 0)"/><path d="M9 8 H15 M9 12 H15 M9 16 H13"/></svg>',
+    "settings": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7 H14 M17 7 H20 M4 12 H7 M10 12 H20 M4 17 H14 M17 17 H20"/><circle cx="16" cy="7" r="2"/><circle cx="8.5" cy="12" r="2"/><circle cx="16" cy="17" r="2"/></svg>',
+    "science": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3 H14 M10.5 3 V9.5 L5.5 18.5 C5 19.6 5.8 21 7 21 H17 C18.2 21 19 19.6 18.5 18.5 L13.5 9.5 V3"/><path d="M8 15.5 H16"/></svg>',
 }
+
+# Role display names — only the five roles the enterprise permission model
+# actually distinguishes between (llm_rbac.yaml) get a specific label;
+# anything else (the inert manufacturing Role values — see
+# backend/app/core/roles.py) falls back to a title-cased version of the raw
+# role string rather than growing this list to match.
+_ROLE_LABELS = {"admin": "Admin", "hr": "HR", "project_manager": "Project Manager", "user": "Employee", "ceo": "CEO"}
 
 # Canonical cost-ascending order/labels/captions for the 3 Claude model
 # tiers LLM-RBAC ever resolves an end-user role to (backend/config/
@@ -94,8 +108,19 @@ def inject_global_styles() -> None:
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-        html, body, [class*="css"] {{
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        /* This Streamlit version's CSS-in-JS classes are named
+        "st-emotion-cache-*" — the old streamlit-extras-era selector
+        "[class*='css']" no longer matches any of them, so this rule was
+        silently a no-op everywhere except the couple of elements that
+        happen to inherit from <body> directly. Every element still fell
+        back to Streamlit's own default ("Source Sans Pro"). Targeting
+        every descendant of the app root with !important is what actually
+        wins against Streamlit's built-in, more-specific font rules. */
+        html, body, .stApp, .stApp *:not([data-testid="stIconMaterial"]) {{
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+        }}
+        .stApp code, .stApp pre, .stApp kbd, .stApp samp {{
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace !important;
         }}
 
         #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] {{ display: none; }}
@@ -195,7 +220,8 @@ def inject_global_styles() -> None:
 
         /* Chat-page-specific — see views/chat.py */
         .ep-empty-state {{ text-align: center; padding: 3rem 1rem 1.5rem; }}
-        .ep-empty-mark {{ font-size: 2rem; color: {PRIMARY}; margin-bottom: 0.5rem; }}
+        .ep-empty-mark {{ color: {PRIMARY}; margin-bottom: 0.5rem; }}
+        .ep-empty-mark svg {{ width: 34px; height: 34px; }}
         .ep-empty-title {{ font-size: 1.4rem; font-weight: 600; color: {INK}; margin: 0 0 0.4rem; }}
         .ep-empty-sub {{ color: {MUTED}; font-size: 0.95rem; }}
         .ep-disclaimer {{ color: {MUTED}; font-size: 0.75rem; text-align: center; margin-top: 0.4rem; }}
@@ -260,12 +286,26 @@ def inject_global_styles() -> None:
     )
 
 
-def sidebar_brand(name: str = "ATHENA", tagline: str = "AI Assistant", mark: str = "✦") -> None:
-    """Logo + product name block pinned to the top of the sidebar."""
+BRAND_MARK_SVG = """
+<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+    <path d="M12 0 L13.8 9.4 L22 4.5 L14.9 11.4 L24 12 L14.9 12.6 L22 19.5
+             L13.8 14.6 L12 24 L10.2 14.6 L2 19.5 L9.1 12.6 L0 12 L9.1 11.4
+             L2 4.5 L10.2 9.4 Z"/>
+</svg>
+"""
+
+
+def sidebar_brand(name: str = "ATHENA", tagline: str = "AI Assistant", mark: str | None = None) -> None:
+    """Logo + product name block pinned to the top of the sidebar. `mark`
+    defaults to an inline SVG sunburst (an evocative mark in the same spirit
+    as this app's existing Claude-inspired palette, not a reproduction of
+    Anthropic's actual trademarked logo) — pass a plain string to override
+    with something else (e.g. an emoji) instead."""
+    mark_html = mark if mark is not None else BRAND_MARK_SVG
     st.markdown(
         f"""
         <div class="ep-brand">
-            <div class="ep-brand-mark">{mark}</div>
+            <div class="ep-brand-mark">{mark_html}</div>
             <div class="ep-brand-text">
                 <div class="ep-brand-name">{name}</div>
                 <div class="ep-brand-tag">{tagline}</div>
@@ -309,7 +349,18 @@ def conversation_row(conv_id: str, label: str, active: bool) -> tuple[bool, bool
     inside ONE top-level {{ }} block using nested selectors (relying on the
     browser's native CSS nesting) — stylable_container only prefixes its
     :has() scope onto the first top-level rule in css_styles; separate
-    sibling rule blocks after it are emitted completely unscoped."""
+    sibling rule blocks after it are emitted completely unscoped.
+
+    Deliberately NOT st.columns() for the title/menu side-by-side layout —
+    live-reproduced bug: st.columns() converts its fractional widths into a
+    pixel width via a one-shot JS/ResizeObserver measurement that gets baked
+    into an inline style on first render. Switching conversations triggers
+    st.switch_page(), which remounts the sidebar; a row's columns can end up
+    measured mid-transition against a near-zero-width sidebar and then never
+    re-measure (no further resize event fires), permanently freezing that
+    row at a few px wide with its title clipped to nothing. Plain CSS flex
+    on the row's own stVerticalBlock has no such cache — the browser
+    recomputes it on every paint — so it can't get stuck this way."""
     bg = SURFACE if active else "transparent"
     weight = 600 if active else 400
     color = PRIMARY if active else INK
@@ -317,7 +368,37 @@ def conversation_row(conv_id: str, label: str, active: bool) -> tuple[bool, bool
         key=f"conv-row-{conv_id}",
         css_styles=f"""
         {{
-            display: flex; align-items: center;
+            display: flex !important; flex-direction: row !important; align-items: center; gap: 2px;
+
+            /* stylable_container's own first child is the hidden, empty
+            marker element it uses for this rule's own :has() targeting
+            (see the auto-generated margin-bottom rule for > div:first-child
+            below, in the same injected stylesheet — it treats :first-child
+            as this same marker). Invisible or not, it's still
+            a real block-level element-container, and Streamlit's own base
+            CSS gives every element-container width:100% — as a flex-basis
+            that's the row's full width, so it claimed the entire row and
+            pushed the real title/menu buttons off past the right edge.
+            Pin it to zero size explicitly rather than relying on flex-
+            shrink to sort it out against two differently-sized siblings. */
+            > div[data-testid="element-container"]:first-child {{ flex: 0 0 0 !important; min-width: 0 !important; }}
+
+            /* Flex properties only take effect on the flex container's
+            DIRECT children — that's these element-container wrappers, not
+            the .stButton/stPopover divs nested a level inside each.
+            flex-basis 0 (not auto) is required here, not stylistic: with
+            auto, the button's own width:100% doesn't count toward its
+            intrinsic content size, so the flex algorithm falls back to
+            sizing this item off the *unclipped* title text's natural
+            width — wider than the space actually available once the fixed
+            20px "⋯" sibling is accounted for — and the title item then
+            visually+interactively overlapped the menu button, silently
+            eating its clicks. A 0 basis makes this item start from nothing
+            and grow purely off leftover space, which is exactly the space
+            this sibling doesn't use. overflow:hidden is a second, harder
+            guarantee against the same class of bug regardless of cause. */
+            > div[data-testid="element-container"]:has(.stButton) {{ flex: 1 1 0%; min-width: 0; overflow: hidden; }}
+            > div[data-testid="element-container"]:has(div[data-testid="stPopover"]) {{ flex: 0 0 auto; }}
 
             div[data-testid="stPopover"] button {{
                 border: none !important; background: transparent !important; box-shadow: none !important;
@@ -326,33 +407,31 @@ def conversation_row(conv_id: str, label: str, active: bool) -> tuple[bool, bool
             div[data-testid="stPopover"] button:hover {{ color: {PRIMARY} !important; }}
             div[data-testid="stPopover"] svg {{ display: none; }}
 
-            div[data-testid="column"]:first-child button {{
+            .stButton button {{
                 border: none !important; background: {bg} !important; box-shadow: none !important;
                 text-align: left !important; justify-content: flex-start !important;
                 font-weight: {weight} !important; color: {color} !important;
                 padding: 0.35rem 0.5rem !important; border-radius: 8px !important; font-size: 0.86rem !important;
-                display: block !important;
+                display: block !important; width: 100% !important;
             }}
-            div[data-testid="column"]:first-child button p {{
+            .stButton button p {{
                 white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;
             }}
-            div[data-testid="column"]:first-child button:hover {{ background: {SURFACE} !important; color: {PRIMARY} !important; }}
+            .stButton button:hover {{ background: {SURFACE} !important; color: {PRIMARY} !important; }}
         }}
         """,
     ):
-        col_title, col_menu = st.columns([0.86, 0.14])
-        with col_title:
-            title_clicked = st.button(label, key=f"conv_btn_{conv_id}", use_container_width=True)
-        with col_menu:
-            with st.popover("⋯", use_container_width=True):
-                delete_clicked = st.button("🗑️ Delete", key=f"conv_del_{conv_id}", use_container_width=True)
+        title_clicked = st.button(label, key=f"conv_btn_{conv_id}", use_container_width=True)
+        with st.popover("⋯", use_container_width=True):
+            delete_clicked = st.button("Delete", key=f"conv_del_{conv_id}", use_container_width=True)
     return title_clicked, delete_clicked
 
 
 def role_label(role: str) -> str:
-    """Plain-text role label for the bottom profile row — deliberately not a
-    colored pill (see role_tag()) since the design brief calls for an
-    understated role indicator there, not a badge."""
+    """Plain-text role label — deliberately not a colored pill/badge; every
+    role indicator in this app (bottom profile row, dashboard's "What you
+    can do") is a plain bold label, with color reserved for buttons/
+    active-state/focus rather than decorating every badge."""
     return _ROLE_LABELS.get(role, role.replace("_", " ").title())
 
 
@@ -425,13 +504,6 @@ def render_capabilities(caps: dict) -> None:
             st.caption(f"• {humanize_action(capability)}")
 
 
-def role_tag(role: str) -> tuple:
-    """A (label, "", color) tuple for streamlit_extras.annotated_text — pass
-    it (optionally alongside plain strings in the same call) to render a
-    role as a colored pill instead of backtick-quoted raw role text."""
-    return (_ROLE_LABELS.get(role, role), "", _ROLE_COLORS.get(role, MUTED))
-
-
 def explorable_table(data) -> None:
     """st.dataframe with streamlit-extras' dataframe_explorer filter UI layered
     on top — for the list-of-dicts/DataFrame results the admin/evaluation/
@@ -446,14 +518,17 @@ def explorable_table(data) -> None:
 def page_header(title: str, icon: str = "", subtitle: str | None = None, color: str = "blue") -> None:
     """Page-top header: a colored icon chip, bold title, muted subtitle, and
     a hairline rule — replaces streamlit-extras' colored_header (whose bright
-    gradient bar read more "dev tool" than enterprise)."""
+    gradient bar read more "dev tool" than enterprise). `icon` is a key into
+    _PAGE_ICONS (e.g. "home", "document"); an unrecognized string still
+    renders as-is (raw HTML/emoji), so old call sites can't silently break."""
     accent = ACCENTS.get(_LEGACY_COLOR_MAP.get(color, color), PRIMARY)
+    icon_html = _PAGE_ICONS.get(icon, icon)
     subtitle_html = f'<p class="ep-header-sub">{subtitle}</p>' if subtitle else ""
     st.markdown(
         f"""
         <div class="ep-header">
             <div class="ep-header-row">
-                <div class="ep-header-icon" style="background:{accent}1A; color:{accent};">{icon}</div>
+                <div class="ep-header-icon" style="background:{accent}1A; color:{accent};">{icon_html}</div>
                 <h1 class="ep-header-title">{title}</h1>
             </div>
             {subtitle_html}
@@ -483,5 +558,36 @@ def card(key: str):
 
 
 def metric_cards() -> None:
-    """Call once after a block of st.metric()s to restyle them as cards."""
-    style_metric_cards(border_left_color=PRIMARY)
+    """Call once after a block of st.metric()s to restyle them as cards —
+    a plain white tile with a uniform thin neutral border on every edge and
+    no shadow, matching claude.ai's own stat-tile treatment (color is
+    reserved for buttons/active-state/focus, not decorating every card).
+
+    Deliberately custom CSS instead of streamlit_extras' style_metric_cards():
+    that helper hardcodes a 0.5rem left border plus matching lopsided
+    padding (its "accent bar" look) that its own border_left_color param
+    can't even out — passing it the same color as the other three sides
+    still leaves a visibly thicker left edge. Writing the rule directly
+    also lets the label/value pick up this app's own type tokens (MUTED/
+    INK) instead of Streamlit's default metric colors."""
+    st.markdown(
+        f"""
+        <style>
+        div[data-testid="stMetric"] {{
+            background-color: {SURFACE};
+            border: 1px solid {BORDER};
+            border-radius: 12px;
+            padding: 1.1rem 1.25rem;
+            box-shadow: none;
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricLabel"] p {{
+            font-size: 0.82rem; font-weight: 500; color: {MUTED};
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
+            font-size: 1.7rem; font-weight: 600; color: {INK};
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricDelta"] {{ font-size: 0.82rem; }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )

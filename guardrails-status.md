@@ -83,4 +83,18 @@ Some documents carry a classification tag — internal, confidential, restricted
 
 ---
 
+## Needs a decision: off-topic requests aren't deterministically blocked
+
+Rail 5 (Scope, in the message-level guardrails table above) exists in the pipeline but is currently a no-op — `GUARDRAIL_SCOPE_DENY_KEYWORDS` and `GUARDRAIL_SCOPE_ALLOW_KEYWORDS` are both unset in `.env`. Live-tested: asking the assistant to "write a poem about cats" passed all 10 rails cleanly and got a real poem back, with a self-redirect to document Q&A tacked on by the model itself — not by any enforced rule. That self-redirect is a model behavior, not deterministic enforcement, and isn't guaranteed on every phrasing or model tier.
+
+**Option A — Leave as-is.** Rely on the model to self-police off-topic requests, same as today. No false-positive risk from a keyword filter, but no hard guarantee either.
+
+**Option B — Deny-list.** Set `GUARDRAIL_SCOPE_DENY_KEYWORDS` to a comma-separated list of known-off-topic terms (poems, jokes, recipes, etc.). Lower risk of blocking legitimate document questions, but not exhaustive — anything not on the list still reaches the model.
+
+**Option C — Allow-list.** Set `GUARDRAIL_SCOPE_ALLOW_KEYWORDS` so only messages matching an approved topic/keyword list pass. Strictest option; risks false-blocking legitimate questions that don't happen to contain a listed keyword.
+
+Both are simple substring/keyword matches (`backend/app/services/guardrails/scope.py`), not semantic — same tradeoff class as rail 2/3's regex checks, not rail 4/6's embedding- or model-based ones.
+
+---
+
 *Scope note: reflects live testing against a local development build on 2026-08-11 — a functional check of the rules as configured, not a formal security audit.*

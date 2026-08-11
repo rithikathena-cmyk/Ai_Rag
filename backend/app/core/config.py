@@ -18,6 +18,13 @@ _BACKEND_ROOT = Path(__file__).resolve().parents[2]
 class Settings(BaseSettings):
     qdrant_host: str = "127.0.0.1"
     qdrant_port: int = 6333
+    # Qdrant Cloud mode: set qdrant_url (e.g. "https://xyz.cloud.qdrant.io:6333")
+    # and qdrant_api_key instead of qdrant_host/qdrant_port — db/qdrant.py
+    # prefers qdrant_url when set, falling back to host/port for local/Docker
+    # Qdrant (which has no auth). Both point at the same collection API, so
+    # nothing above db/qdrant.py needs to know which mode is active.
+    qdrant_url: str = ""
+    qdrant_api_key: str = ""
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
     environment: str = "development"
@@ -27,6 +34,12 @@ class Settings(BaseSettings):
     postgres_db: str = "ragchat"
     postgres_user: str = "ragchat"
     postgres_password: str = "ragchat"
+    # Managed Postgres (Supabase, Neon, RDS, ...) requires SSL on external
+    # connections; local/Docker Postgres has none configured, so this is
+    # opt-in via .env rather than a hardcoded "require" that would break the
+    # existing local dev setup. Passed straight through to libpq's sslmode —
+    # "require" is Supabase's documented value.
+    postgres_sslmode: str = ""
 
     # Infra resilience (docs/RAG_RETRIEVAL.md's /search hardening) — timeouts,
     # pool sizing, and retry policy for the two backing stores the retrieval
@@ -48,6 +61,15 @@ class Settings(BaseSettings):
 
     upload_dir: str = str(_BACKEND_ROOT / "document_storage")
     max_upload_size_mb: int = 100
+
+    # Comma-separated allowed origins for the Streamlit frontend (browser-side
+    # requests only — api_client.py's own calls are server-to-server Python
+    # `requests` and aren't subject to CORS at all, so this matters mainly for
+    # Streamlit's websocket/asset traffic and any future client-side fetches).
+    # Local dev default covers `streamlit run` on its default port; add the
+    # deployed Streamlit Community Cloud URL (https://<app>.streamlit.app) in
+    # production.
+    cors_allowed_origins: str = "http://localhost:8501"
 
     embedding_model_name: str = "BAAI/bge-m3"
     embedding_dimension: int = 1024

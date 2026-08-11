@@ -5,7 +5,7 @@ from api_client import APIError
 from components import MODEL_TIER_LABELS, page_header, show_api_error, sorted_model_tiers
 
 page_header(
-    "Roles & Permissions", "🗂️",
+    "Roles & Permissions", "shield",
     "Read-only view of each role's permission, tool, and quota configuration.",
     color="violet-70",
 )

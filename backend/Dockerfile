@@ -19,4 +19,8 @@ ENV OMP_NUM_THREADS=4
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Shell form (not exec-array form) so $PORT actually expands — Render's
+# Docker services inject a dynamic PORT env var the container must bind to;
+# docker-compose.yml never sets PORT, so this falls back to 8000, identical
+# to the previous hardcoded behavior for local/Docker Compose use.
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}

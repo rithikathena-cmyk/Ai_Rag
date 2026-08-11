@@ -16,7 +16,7 @@ except APIError:
 _can_manage = has_permission(_capabilities, MANAGE_USERS)
 
 page_header(
-    "Users", "👥",
+    "Users", "group",
     "Directory of every account on this platform." if not _can_manage
     else "Directory of every account — role and active-status changes are audited on the backend.",
     color="violet",
@@ -31,7 +31,7 @@ _current_role = (st.session_state.get("current_user") or {}).get("role")
 _can_create = _current_role in ("admin", "ceo")
 
 if _can_create:
-    with st.expander("➕ Create a new account", expanded=False):
+    with st.expander("Create a new account", expanded=False, icon=":material/add:"):
         with st.form("create_user_form", clear_on_submit=True):
             new_email = st.text_input("Email", key="new_user_email")
             new_display_name = st.text_input("Display name (optional)", key="new_user_display_name")

@@ -15,3 +15,5 @@ snapshots/
 backend/scripts/seeded_users.csv
 backend/scripts/seeded_users.xlsx
 .playwright-mcp/
+frontend/.streamlit/secrets.toml
+.cloudflared/

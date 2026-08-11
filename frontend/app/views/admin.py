@@ -4,7 +4,7 @@ import api_client
 from api_client import APIError
 from components import card, debug_json, explorable_table, metric_cards, page_header, show_api_error
 
-page_header("Admin", "🛠️", "Collections, metrics, cost, and guardrail operations.", color="red-70")
+page_header("Admin", "settings", "Collections, metrics, cost, and guardrail operations.", color="red-70")
 metric_cards()
 
 try:

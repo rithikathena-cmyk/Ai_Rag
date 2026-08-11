@@ -4,8 +4,8 @@ from streamlit_extras.stylable_container import stylable_container
 import api_client
 from api_client import APIError
 from components import (
-    BG_SECONDARY, INK, MODEL_TIER_CAPTIONS, MODEL_TIER_LABELS, MODEL_TIER_ORDER, PRIMARY, debug_json, show_api_error,
-    sorted_model_tiers,
+    BG_SECONDARY, BORDER, BRAND_MARK_SVG, INK, MODEL_TIER_CAPTIONS, MODEL_TIER_LABELS, MODEL_TIER_ORDER, PRIMARY,
+    debug_json, render_capabilities, role_label, show_api_error, sorted_model_tiers,
 )
 from permissions import UPLOAD_DOCUMENTS, has_permission
 
@@ -107,8 +107,14 @@ def render_model_picker(allowed_tiers: list[str]) -> None:
     security boundary. A request naming a tier outside this list still gets
     a 403 from authorize_llm_request()/_resolve_tier() on the backend
     (services/llm_rbac/engine.py) regardless of what this popover shows —
-    verified live for every role during the role-based model access pass."""
+    verified live for every role during the role-based model access pass.
+
+    No role in llm_rbac.yaml currently ships with an empty tiers_allowed
+    (every role gets at least haiku), but a future role/config change could
+    introduce one — a clear caption here beats silently rendering nothing,
+    which would otherwise look like the composer forgot to load."""
     if not allowed_tiers:
+        st.caption("No model is available for your role — contact an administrator.")
         return
     selected = st.session_state.chat_model_tier
     selected_label = _TIER_LABELS.get(selected, selected.capitalize())
@@ -215,13 +221,60 @@ _logged_in_user = st.session_state["current_user"]
 
 # New chat / search / recent conversations / Settings (Top K, reasoning
 # trace) all moved to main.py's sidebar — persistent across every page now,
-# not just this one. "What you can do" (capabilities) lives on the
-# Dashboard page already (render_capabilities() there); not duplicated here.
+# not just this one. "What you can do" (capabilities) is reachable from the
+# centered pill below on every chat, so the model tier in use is always
+# visible while actually chatting instead of only on the Dashboard page.
 
 # ---------------------------------------------------------------- main area
 
 if _capabilities_error:
     show_api_error(_capabilities_error)
+
+# Centered "Role · Model" pill — a dropdown (st.popover), not a persistent
+# side rail, back to the page's normal single-column layout. The label
+# itself already surfaces the model tier in use at a glance; opening it
+# reveals the same Role/Tools/"You can" detail as Dashboard's "What you
+# can do" via render_capabilities().
+_current_tier_label = _TIER_LABELS.get(st.session_state.get("chat_model_tier", ""), "")
+_trigger_label = f"{role_label(_logged_in_user['role'])} · Claude {_current_tier_label}" if _current_tier_label else role_label(_logged_in_user["role"])
+
+with stylable_container(
+    key="chat-permissions-trigger",
+    css_styles=f"""
+    {{
+        /* stVerticalBlock's default flex-direction is column (it stacks
+        elements vertically) — align-items is what centers along its
+        CROSS axis (horizontal, for a column container); justify-content
+        would center along its MAIN axis (vertical) instead, which is a
+        no-op here since this block only ever holds the one row. */
+        display: flex; align-items: center; margin-bottom: 1rem;
+
+        /* st.popover renders as a direct stPopover child of this
+        stVerticalBlock (no element-container wrapper the way st.markdown
+        gets one), and align-items' default "stretch" — combined with
+        Streamlit's own base CSS giving it width:100% — stretches it to
+        the block's full width, leaving nothing for align-items:center to
+        center against (the same Streamlit quirk worked around in
+        conversation_row() below). An explicit width overrides stretch
+        sizing, shrinking it to content so the centering above actually
+        has visible effect. */
+        > div[data-testid="stPopover"] {{ width: fit-content !important; min-width: 0 !important; }}
+
+        div[data-testid="stPopover"] button {{
+            border: 1px solid {BORDER} !important; border-radius: 999px !important;
+            font-weight: 500; padding: 0.35rem 0.9rem !important; color: {INK} !important; box-shadow: none !important;
+        }}
+        div[data-testid="stPopover"] button:hover {{ border-color: {PRIMARY} !important; color: {PRIMARY} !important; }}
+    }}
+    """,
+):
+    with st.popover(f"{_trigger_label}  ▾"):
+        st.markdown("**Your access**")
+        if _capabilities_error:
+            show_api_error(_capabilities_error)
+        elif _capabilities:
+            st.caption(f"Role: {role_label(_logged_in_user['role'])}")
+            render_capabilities(_capabilities)
 
 # Role-specific empty-state copy (design brief §14) — keyed by role, with a
 # generic fallback for any role not explicitly named there.
@@ -240,7 +293,7 @@ if not st.session_state.chat_messages:
     st.markdown(
         f"""
         <div class="ep-empty-state">
-            <div class="ep-empty-mark">✦</div>
+            <div class="ep-empty-mark">{BRAND_MARK_SVG}</div>
             <div class="ep-empty-title">How can I help?</div>
             <div class="ep-empty-sub">{welcome}</div>
         </div>
@@ -289,7 +342,12 @@ if st.session_state.chat_messages:
 # require_permission(UPLOAD_DOCUMENTS) is the real, unbypassable gate).
 _can_upload = has_permission(_capabilities, UPLOAD_DOCUMENTS)
 
-if _can_upload or _allowed_tiers:
+# _capabilities (not just _allowed_tiers) in this condition is what lets the
+# toolbar still render — and therefore render_model_picker()'s "no model
+# available" caption still show — for a hypothetical role whose
+# tiers_allowed comes back empty; without it the whole toolbar (and that
+# message) would be skipped entirely whenever _can_upload is also False.
+if _can_upload or _allowed_tiers or _capabilities:
     with stylable_container(
         key="composer-toolbar",
         css_styles=f"""

@@ -20,16 +20,19 @@ def _dsn() -> str:
 def get_engine():
     global _engine
     if _engine is None:
+        connect_args = {
+            "connect_timeout": settings.postgres_connect_timeout_seconds,
+            "options": f"-c statement_timeout={settings.postgres_statement_timeout_ms}",
+        }
+        if settings.postgres_sslmode:
+            connect_args["sslmode"] = settings.postgres_sslmode
         _engine = create_engine(
             _dsn(),
             pool_pre_ping=True,
             pool_size=settings.postgres_pool_size,
             max_overflow=settings.postgres_max_overflow,
             pool_timeout=settings.postgres_pool_timeout_seconds,
-            connect_args={
-                "connect_timeout": settings.postgres_connect_timeout_seconds,
-                "options": f"-c statement_timeout={settings.postgres_statement_timeout_ms}",
-            },
+            connect_args=connect_args,
         )
     return _engine
 

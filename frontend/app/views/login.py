@@ -2,14 +2,14 @@ import streamlit as st
 
 import api_client
 from api_client import APIError
-from components import INK, MUTED, PRIMARY, show_api_error
+from components import BRAND_MARK_SVG, INK, MUTED, PRIMARY, show_api_error
 
 st.markdown(
     f"""
     <div style="text-align:center; padding: 2rem 0 0.5rem;">
         <div style="width:52px; height:52px; margin:0 auto 0.75rem; border-radius:12px;
                     background:{PRIMARY}; display:flex;
-                    align-items:center; justify-content:center; font-size:26px; color:#FFFFFF;">✦</div>
+                    align-items:center; justify-content:center; color:#FFFFFF;">{BRAND_MARK_SVG}</div>
         <h1 style="margin:0; font-size:1.6rem; color:{INK};">RAG Platform</h1>
         <p style="color:{MUTED}; margin-top:0.35rem;">Sign in to chat, search, and manage your knowledge base.</p>
     </div>

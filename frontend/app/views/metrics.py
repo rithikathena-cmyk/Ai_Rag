@@ -7,7 +7,7 @@ from api_client import APIError
 from components import explorable_table, metric_cards, page_header, show_api_error
 
 page_header(
-    "Query Metrics", "📈",
+    "Query Metrics", "monitoring",
     "Per-query stage timing for retrieval (search/chat) and ingestion (uploads) — not just endpoint averages.",
     color="light-blue-70",
 )
