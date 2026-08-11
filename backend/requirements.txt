@@ -6,8 +6,11 @@ qdrant-client==1.11.2
 sqlalchemy==2.0.51
 psycopg[binary]==3.3.4
 python-multipart==0.0.32
+pyjwt==2.10.1
+pyyaml==6.0.2
 
 docling==2.117.0
+pymupdf==1.28.0
 pandas==2.3.3
 openpyxl==3.1.5
 tabulate==0.10.0
@@ -25,6 +28,7 @@ transformers==5.14.1
 tokenizers==0.22.2
 huggingface-hub==1.26.0
 anthropic==0.120.2
+httpx==0.28.1  # already a transitive dep of anthropic; pinned explicitly now that services/guardrails/llm_check.py calls it directly
 langgraph==1.2.10
 langchain-anthropic==1.5.3
 langchain-core==1.5.3

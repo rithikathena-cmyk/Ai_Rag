@@ -8,7 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.postgres import Base
 
 
-class Document(Base):
+class DocumentModel(Base):
     __tablename__ = "documents"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -53,6 +53,24 @@ class Document(Base):
         UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
     )
     is_latest_version: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # LLM-RBAC access-control fields. `department` + `access_roles` drive
+    # apply_category_policy() (services/guardrails/retrieval_permissions.py);
+    # `security_classification` is deliberately distinct from `classification`
+    # above, which is a content-taxonomy label, not an access-control one —
+    # see docs/KNOWLEDGE_ACCESS_CONTROL.md.
+    department: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    access_roles: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    security_classification: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="internal", server_default="internal"
+    )
+    project: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approval_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="approved", server_default="approved"
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), onupdate=func.now(), nullable=True)

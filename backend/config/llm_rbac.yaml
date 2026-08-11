@@ -1,0 +1,427 @@
+# LLM RBAC policy — the single source of truth for what each role may do with
+# the Claude Gateway. Loaded via core/yaml_config.load_yaml_config() (same
+# pattern as models.yaml/guardrails.yaml) and consulted exclusively through
+# services/llm_rbac/engine.py::authorize_llm_request() — no other module
+# should read this file directly, so there is one place that interprets it.
+#
+# `enabled: false` is a full kill switch: services/llm_rbac/engine.py returns
+# an always-allow, unlimited decision (today's pre-RBAC behavior) without
+# touching any of the lists below. Flip it off if something in this policy
+# misbehaves post-deploy without needing a code change.
+#
+# Role keys match core/roles.py::Role values exactly. `user` is "Employee" —
+# kept as the existing enum value rather than renamed, so no existing
+# user/API contract breaks (see docs/LLM_RBAC_ARCHITECTURE.md for the naming
+# rationale). `ceo` was split out from `admin` (previously one combined
+# "CEO/Admin" role) so the coarse permission matrix below can give CEO
+# executive/approval powers without System Settings or Manage Roles.
+#
+# `rbac_permissions` (added per role below) is the coarse, REST-resource
+# permission catalog (see app/core/permissions.py::Permission) used for
+# nav visibility and endpoint gating via require_permission() —
+# distinct from `permissions.allow/deny` above, which gates fine-grained
+# named *actions* inside /chat and /search via authorize_llm_request().
+# Same file, same loader (policy_loader.py), two different granularities —
+# not a second RBAC system.
+#
+# Some `permissions.allow` entries name a capability this repository has no
+# underlying data/tool for yet (e.g. machine_status, workforce_planning,
+# production_scheduling — there is no machine/attendance/production table in
+# this schema). Those are enforced correctly (the policy check passes) but
+# currently unreachable — no route exists to trigger them. This mirrors how
+# the 11 manufacturing Role values already sit inert in this codebase; see
+# docs/ROLE_PERMISSION_MATRIX.md for the wired-vs-inert breakdown per action.
+enabled: true
+
+departments:
+  - manufacturing
+  - hr
+  - engineering
+  - executive
+
+roles:
+  user: # Employee
+    display_name: Employee
+    department_default: manufacturing
+    model:
+      # Role-based model-access policy: Employee gets only the cheapest/
+      # fastest tier — no Sonnet, no Opus.
+      tiers_allowed: [haiku]
+      default_tier: haiku
+      # No entry here is intentional: an Employee request can never resolve
+      # to any tier but haiku — see services/llm_rbac/engine.py::_resolve_tier().
+      escalate_to_opus_for: []
+    knowledge_departments: [manufacturing]
+    tools: [search_documents]
+    sql_allowed_tables: []
+    permissions:
+      allow:
+        - search_manuals
+        - search_sops
+        - search_safety_manuals
+        - search_work_instructions
+        - search_inspection_procedures
+        - explain_manuals
+        - explain_sops
+        - machine_status # no machine table in this schema — enforced, unreachable
+        - production_status # no production table in this schema — enforced, unreachable
+        - personal_task_guidance
+        - training_assistant
+        - manufacturing_qa
+        - simple_summary
+      deny:
+        - upload_documents
+        - delete_documents
+        - edit_manuals
+        - project_creation
+        - project_update
+        - project_allocation
+        - project_submit
+        - hr_information
+        - executive_reports
+        - financial_information
+        - administration
+        - prompt_configuration
+        - system_settings
+    quotas:
+      requests_per_minute: 20
+      daily_requests: 200
+      daily_tokens: 100000
+      monthly_tokens: 2000000
+      monthly_cost_usd: 50
+      max_concurrent_requests: 2
+    approval_required_actions: []
+    # Coarse permission catalog (see file-header comment above) — Employee
+    # gets the chatbot and nothing else; no document/analytics/admin access.
+    rbac_permissions:
+      - CHAT
+      - VIEW_CONVERSATIONS
+    # Report-type catalog (docs/USER_WISE_REPORT_RBAC.md) — distinct from
+    # `permissions` above: this names report *artifacts* a role may request,
+    # not general capabilities. machine_status/shift_report/production_summary/
+    # machine_performance have no backing data model in this schema (no
+    # machine/shift/production table) — enforced correctly, but generating one
+    # returns "no data source configured" rather than fabricated numbers; see
+    # services/llm_rbac/report_policy.py's NO_DATA_REPORT_TYPES.
+    reports:
+      allowed:
+        - machine_status
+        - shift_report
+        - production_summary
+        - assigned_work
+        - manual_summary
+        - sop_summary
+        - machine_performance
+
+  hr:
+    display_name: HR
+    department_default: hr
+    model:
+      # Role-based model-access policy: HR gets Haiku + Sonnet, NOT Opus —
+      # deliberately different from Project Manager's Sonnet + Opus (no
+      # Haiku), so the two roles' model access is never identical.
+      tiers_allowed: [haiku, sonnet]
+      default_tier: sonnet
+      # Declared but currently a no-op: _resolve_tier() only escalates to
+      # opus when "opus" is in tiers_allowed, which HR's no longer is (see
+      # above) — kept rather than deleted so a future config change that
+      # re-adds opus to HR doesn't also need to rediscover these trigger
+      # actions, matching this file's existing "declared but unreachable"
+      # convention (see e.g. roles.user.permissions.allow's machine_status).
+      escalate_to_opus_for: [workforce_planning, leave_analytics]
+    knowledge_departments: [hr]
+    tools: [search_documents, query_analytics, generate_report]
+    sql_allowed_tables: [conversations, messages, eval_queries, eval_runs, reports]
+    permissions:
+      allow:
+        - attendance_analytics # no attendance table in this schema — enforced, unreachable
+        - performance_analytics # no performance table in this schema — enforced, unreachable
+        - leave_analytics # no leave table in this schema — enforced, unreachable
+        - workforce_planning # no workforce table in this schema — enforced, unreachable
+        - hr_document_search
+        - hr_report_generation
+        - training_analytics # no training-records table in this schema — enforced, unreachable
+        - certification_reports # no certification table in this schema — enforced, unreachable
+        - policy_assistant
+        # Enterprise permission matrix update: HR now has Upload Documents
+        # (full) and Delete Documents (Limited — see approval_required_actions
+        # below) — previously both were denied; moved out of deny below.
+        - upload_documents
+        - delete_documents
+      deny:
+        - machine_control
+        - engineering_document_upload
+        - production_scheduling
+        - maintenance_operations
+        - project_creation
+        - project_update
+        - project_allocation
+        - project_submit
+    quotas:
+      requests_per_minute: 30
+      daily_requests: 300
+      daily_tokens: 300000
+      monthly_tokens: 6000000
+      monthly_cost_usd: 200
+      max_concurrent_requests: 3
+    # HR's "Delete Documents" is Limited in the permission matrix (not a
+    # blanket allow like CEO/Admin) — paired with delete_documents below,
+    # a delete queues an ApprovalRequestModel for CEO/Admin instead of
+    # applying immediately, same mechanism project_manager already uses.
+    approval_required_actions:
+      - delete_documents
+    # Coarse permission catalog — HR gets document + analytics + user
+    # visibility, but not user/role management or audit logs (both are
+    # "Limited" in the matrix, and this app has no finer-grained slice of
+    # either to grant yet — see plan doc's judgment-call note).
+    rbac_permissions:
+      - CHAT
+      - VIEW_CONVERSATIONS
+      - VIEW_DOCUMENTS
+      - UPLOAD_DOCUMENTS
+      - DELETE_DOCUMENTS
+      - MANAGE_DOCUMENTS
+      - VIEW_ANALYTICS
+      - VIEW_USERS
+    reports:
+      allowed:
+        - attendance
+        - employee_performance
+        - leave
+        - training
+        - certification
+        - workforce
+        - hr_analytics
+        - employee_summary
+
+  project_manager:
+    display_name: Project Manager
+    department_default: engineering
+    model:
+      tiers_allowed: [sonnet, opus]
+      default_tier: sonnet
+      escalate_to_opus_for: [engineering_planning, risk_assessment]
+    knowledge_departments: [engineering]
+    tools: [search_documents, query_analytics, generate_report, list_my_projects]
+    sql_allowed_tables: [documents, chunks, entities, terms, reports, conversations, messages]
+    permissions:
+      allow:
+        - upload_manuals
+        - upload_sops
+        - upload_engineering_documents
+        - upload_project_documents
+        # Generic counterpart of the four upload_* entries above — the actual
+        # POST /documents/upload endpoint (routers/documents.py) doesn't know
+        # a document's sub-type at request time, so it checks this single
+        # action name rather than picking one of the four above.
+        - upload_documents
+        # Paired with approval_required_actions below: PM may request a
+        # delete, but it's queued as an ApprovalRequestModel for CEO/Admin to
+        # approve/reject via POST /approvals/{id}/decide, not applied
+        # immediately (see routers/documents.py::delete_document()).
+        - delete_documents
+        - project_creation # routers/projects.py::create_project() — PM's own draft projects
+        - project_update # routers/projects.py::update_project() — own draft projects only
+        - project_allocation # routers/projects.py::add_members() — own projects only
+        - project_submit # routers/projects.py::submit_project() — creates an ApprovalRequestModel
+        - assign_engineers # no separate endpoint from project_allocation — enforced, unreachable
+        - project_status_reports
+        - engineering_search
+        - risk_assessment
+        - document_summarization
+        - technical_report_generation
+        - engineering_qa
+      deny:
+        - hr_administration
+        - payroll
+        - ceo_dashboards
+        - enterprise_administration
+    quotas:
+      requests_per_minute: 30
+      daily_requests: 300
+      daily_tokens: 300000
+      monthly_tokens: 6000000
+      monthly_cost_usd: 200
+      max_concurrent_requests: 3
+    approval_required_actions:
+      # A PM's upload becomes visible to their department immediately; a
+      # publish/delete of an already-approved document needs sign-off. See
+      # docs/AUDIT_LOGGING.md §"Approval" for the (intentionally minimal) v1
+      # scope — no MCP/destructive tools exist in this repo to gate beyond this.
+      - delete_documents
+    # Coarse permission catalog — same shape as HR's (document + analytics +
+    # user visibility, no user/role management or audit logs).
+    rbac_permissions:
+      - CHAT
+      - VIEW_CONVERSATIONS
+      - VIEW_DOCUMENTS
+      - UPLOAD_DOCUMENTS
+      - DELETE_DOCUMENTS
+      - MANAGE_DOCUMENTS
+      - VIEW_ANALYTICS
+      - VIEW_USERS
+    reports:
+      allowed:
+        - project_status
+        - project_progress
+        - project_summary
+        - project_risk
+        - resource_allocation
+        - engineering_report
+        - project_document_summary
+        - project_performance
+
+  ceo:
+    display_name: CEO
+    department_default: executive
+    model:
+      # Role-based model-access policy: CEO gets every configured tier,
+      # including any future one added to models.yaml — "*" resolves to
+      # policy_loader.py's _ROLE_DRIVEN_TIERS, not a hardcoded list.
+      tiers_allowed: ["*"]
+      default_tier: sonnet
+      escalate_to_opus_for: [workforce_planning, leave_analytics, engineering_planning, risk_assessment]
+    # Same broad enterprise data access as admin — CEO needs enterprise-wide
+    # visibility for oversight, it's system *configuration* (roles, settings)
+    # that's withheld, not data.
+    knowledge_departments: [manufacturing, hr, engineering, executive]
+    tools: [search_documents, query_analytics, generate_report, list_my_projects]
+    sql_allowed_tables: null
+    permissions:
+      # Real capability list (not admin's "*" wildcard) — everything a
+      # business/enterprise-oversight role needs, explicitly excluding the
+      # three system-configuration actions in deny below. Union of hr's +
+      # project_manager's substantive allow entries plus the executive-only
+      # ones (hr_information, executive_reports, financial_information,
+      # ceo_dashboards, enterprise_administration, hr_administration, payroll)
+      # that user.deny/project_manager.deny reserve for this tier.
+      allow:
+        - search_manuals
+        - search_sops
+        - search_safety_manuals
+        - search_work_instructions
+        - search_inspection_procedures
+        - explain_manuals
+        - explain_sops
+        - machine_status
+        - production_status
+        - personal_task_guidance
+        - training_assistant
+        - manufacturing_qa
+        - simple_summary
+        - attendance_analytics
+        - performance_analytics
+        - leave_analytics
+        - workforce_planning
+        - hr_document_search
+        - hr_report_generation
+        - training_analytics
+        - certification_reports
+        - policy_assistant
+        - upload_manuals
+        - upload_sops
+        - upload_engineering_documents
+        - upload_project_documents
+        - upload_documents
+        - delete_documents
+        - project_creation
+        - project_update
+        - project_allocation
+        - project_submit
+        - assign_engineers
+        - project_status_reports
+        - engineering_search
+        - risk_assessment
+        - document_summarization
+        - technical_report_generation
+        - engineering_qa
+        - hr_information
+        - executive_reports
+        - financial_information
+        - ceo_dashboards
+        - enterprise_administration
+        - hr_administration
+        - payroll
+      # System-configuration actions only — matches the matrix's "System
+      # Settings ✗" for CEO (contrast with admin's permissions.allow: ["*"]).
+      deny:
+        - administration
+        - prompt_configuration
+        - system_settings
+    quotas:
+      requests_per_minute: null
+      daily_requests: null
+      daily_tokens: null
+      monthly_tokens: null
+      monthly_cost_usd: null
+      max_concurrent_requests: 10
+    # CEO is the approver, not a requester — no action of theirs queues for
+    # further sign-off (mirrors admin's empty list).
+    approval_required_actions: []
+    # Coarse permission catalog — CEO gets everything except Manage Users,
+    # Manage Roles, and System Settings (admin-only per the matrix). Notably
+    # DOES get View Roles (read-only oversight) unlike HR/PM.
+    rbac_permissions:
+      - CHAT
+      - VIEW_CONVERSATIONS
+      - VIEW_DOCUMENTS
+      - UPLOAD_DOCUMENTS
+      - DELETE_DOCUMENTS
+      - MANAGE_DOCUMENTS
+      - VIEW_ANALYTICS
+      - VIEW_USERS
+      - VIEW_ROLES
+      - VIEW_AUDIT_LOGS
+    reports:
+      allowed: ["*"]
+
+  admin:
+    display_name: Admin
+    department_default: executive
+    model:
+      # Role-based model-access policy: Admin gets every configured tier,
+      # same "*" wildcard as CEO above.
+      tiers_allowed: ["*"]
+      default_tier: sonnet
+      dynamic: true
+      # Admin gets the union of every other role's escalation triggers,
+      # resolved at load time by services/llm_rbac/policy_loader.py rather
+      # than duplicated here.
+      escalate_to_opus_for: []
+    knowledge_departments: [manufacturing, hr, engineering, executive]
+    tools: [search_documents, query_analytics, generate_report, list_my_projects]
+    sql_allowed_tables: null # null = the sql_guard module's full default allowlist, no narrowing
+    permissions:
+      allow: ["*"]
+      deny: []
+    quotas:
+      requests_per_minute: null
+      daily_requests: null
+      daily_tokens: null
+      monthly_tokens: null
+      monthly_cost_usd: null
+      max_concurrent_requests: 10
+    approval_required_actions: []
+    # Coarse permission catalog — Admin gets every permission, including
+    # Manage Users/Roles and System Settings that CEO above doesn't.
+    rbac_permissions:
+      - CHAT
+      - VIEW_CONVERSATIONS
+      - VIEW_DOCUMENTS
+      - UPLOAD_DOCUMENTS
+      - DELETE_DOCUMENTS
+      - MANAGE_DOCUMENTS
+      - VIEW_ANALYTICS
+      - VIEW_USERS
+      - MANAGE_USERS
+      - VIEW_ROLES
+      - MANAGE_ROLES
+      - VIEW_AUDIT_LOGS
+      - SYSTEM_SETTINGS
+    # Covers both CEO's full report catalog (executive_report, project_portfolio,
+    # production, maintenance, quality, inventory, warehouse, procurement, hr,
+    # workforce, enterprise, risk, management_summary, ...) and Admin's own
+    # "*" — combined into one role per docs/LLM_RBAC_ARCHITECTURE.md §4's
+    # existing CEO/Admin naming decision, not a narrowing of either.
+    reports:
+      allowed: ["*"]

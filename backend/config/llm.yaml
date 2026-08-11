@@ -1,0 +1,29 @@
+# Claude Gateway behavior: provider, retry policy, request timeout, caching.
+provider: anthropic
+
+retry:
+  max_retries: 3
+  base_delay_seconds: 1.0
+  max_delay_seconds: 20.0
+  # Which anthropic exception types are worth retrying (transient/server-side)
+  # vs. failing fast (client error — retrying won't help).
+  retryable_errors:
+    - RateLimitError
+    - APIConnectionError
+    - APITimeoutError
+    - InternalServerError
+
+request_timeout_seconds: 60.0
+
+cache:
+  # Anthropic prompt caching (cache_control on the system block) — cheap to
+  # enable broadly since system prompts here are static per agent/version.
+  prompt_cache_enabled: true
+
+concurrency:
+  # Process-wide cap on Claude calls in flight at once (gateway/claude_gateway.py's
+  # capacity_guard()), on top of llm_rbac's per-user ConcurrencyGuard — bounds
+  # request-thread-pool/memory usage under a multi-user burst and avoids
+  # tripping Anthropic's own account-level rate limits. At capacity, a call
+  # fails fast (GenerationError) rather than queuing.
+  max_in_flight_requests: 20

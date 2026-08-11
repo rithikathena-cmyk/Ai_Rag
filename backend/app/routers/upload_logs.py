@@ -5,10 +5,16 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core.permissions import Permission
 from app.db.postgres import get_db
 from app.models.upload_log import UploadLogModel
+from app.services.auth.rbac import require_permission
 
-router = APIRouter()
+# Previously had no auth at all — anyone could list ingestion upload/
+# rejection history (filenames, error messages) unauthenticated. This is an
+# audit trail of who uploaded what and what failed, so it's gated the same
+# as the rest of the audit-log surface (VIEW_AUDIT_LOGS).
+router = APIRouter(dependencies=[Depends(require_permission(Permission.VIEW_AUDIT_LOGS))])
 
 
 class UploadLogResponse(BaseModel):

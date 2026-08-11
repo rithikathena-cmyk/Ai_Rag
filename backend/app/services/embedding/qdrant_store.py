@@ -79,3 +79,19 @@ def delete_document_points(document_id: uuid.UUID) -> None:
         collection_name=settings.qdrant_collection_name,
         points_selector=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=str(document_id)))]),
     )
+
+
+def document_point_count(document_id: uuid.UUID) -> int:
+    """How many points this document actually has in the live Qdrant
+    collection right now — the ground truth to compare against Postgres'
+    ChunkModel row count for the same document (see
+    services/ingestion/consistency.py). A mismatch here is invisible to the
+    ingestion code path itself: build_chunk_rows() assigns qdrant_point_id
+    to every ChunkModel row eagerly, before any Qdrant write is even
+    attempted, so that column reflects intent, not confirmed presence — this
+    function is what actually asks Qdrant."""
+    ensure_collection()
+    return get_qdrant_client().count(
+        collection_name=settings.qdrant_collection_name,
+        count_filter=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=str(document_id)))]),
+    ).count

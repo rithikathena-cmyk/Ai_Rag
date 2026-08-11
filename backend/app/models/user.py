@@ -17,6 +17,7 @@ class UserModel(Base):
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="user", server_default="user")
+    department: Mapped[str | None] = mapped_column(String(64), nullable=True)
     preferences: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

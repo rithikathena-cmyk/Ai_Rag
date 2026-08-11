@@ -1,0 +1,70 @@
+# Guardrail toggles.
+#
+# input/output/scope/pii/length checks below MIRROR settings.guardrail_* in
+# core/config.py for reference only — those env-backed flags remain the
+# actual source of truth (already wired through services/guardrails/pipeline.py).
+# Do not add new logic that reads these five back out of this file; they're
+# here so the full guardrail posture is visible in one place.
+input:
+  jailbreak_detection: true # settings.guardrail_block_prompt_injection
+  destructive_intent_detection: true # settings.guardrail_block_destructive_intent
+  pii_detection: true # settings.guardrail_redact_pii
+  scope_check: true # settings.guardrail_scope_deny_keywords / _allow_keywords
+
+output:
+  system_prompt_leak_check: true # settings.guardrail_block_system_prompt_leak
+  pii_detection: true # settings.guardrail_redact_pii
+
+# The two rails below are genuinely new (this file IS their source of truth —
+# there is no equivalent Settings field for either).
+retrieval:
+  # Filters resolved document IDs against PermissionModel before they reach
+  # Qdrant. Only takes effect when a caller supplies a user_id (chat.py does;
+  # anonymous/no-user calls are unaffected, matching current behavior).
+  permission_filtering_enabled: true
+
+output_citation_rail:
+  # Flags (does not block) replies that used retrieved sources but contain no
+  # bracketed citation marker, and attaches a High/Medium/Low confidence
+  # score derived from the reranked sources' scores.
+  citation_check_enabled: true
+
+# LLM-based advanced input check (docs/GUARDRAILS_ARCHITECTURE.md §10) — a
+# second-pass rail for phrasing the deterministic regex/keyword checks above
+# can miss (paraphrased/obfuscated injection or destructive-intent attempts).
+# Off by default, same posture as Phase 3A/3B: experimental, opt-in. Only
+# ever reached if none of the deterministic input checks already blocked —
+# positioned last in the pipeline specifically so a message that regex
+# already caught never pays for this call at all.
+llm_advanced_check:
+  enabled: true
+  # anthropic: routed through the existing Claude Gateway (retries, prompt
+  # caching, usage tracking, the process-wide concurrency cap all apply for
+  # free) — real Anthropic token cost per message this check runs on. Switch
+  # back to `gemini` (a $0 free-tier quota, fully separate from the gateway)
+  # if GEMINI_API_KEY is configured again — see services/guardrails/llm_check.py.
+  provider: anthropic
+  # A ModelTier name for the anthropic provider (haiku = cheapest, since this
+  # check runs on every message that reaches it) — or a literal Gemini model
+  # string if provider: gemini (gemini-flash-latest is the free-tier alias
+  # that actually has quota as of this writing; 2.0/2.5-flash-lite 404).
+  model: haiku
+  timeout_seconds: 4.0 # only consulted by the gemini provider — the anthropic provider uses the gateway's own request_timeout_seconds (llm.yaml)
+  max_input_chars: 2000 # matches the zero-shot classifier's truncation convention
+  # Shared (not per-user) cap on calls/minute — protects Gemini's free-tier
+  # RPM quota on that provider, and caps overall cost exposure on the
+  # anthropic provider, since this check runs per message. Exceeding it
+  # fails open (see services/guardrails/llm_check.py) before the call is
+  # made. null/0 disables limiting.
+  rate_limit_per_minute: 12
+
+# Local, non-LLM semantic input check (docs/GUARDRAILS_ARCHITECTURE.md §12) —
+# catches paraphrased/obfuscated variants of injection.py's/destructive.py's
+# regex patterns via embedding similarity (BGE-M3, already loaded for
+# retrieval — no LLM call, no new model). On by default: unlike
+# llm_advanced_check above, this one is free and fast enough to run on every
+# message, not just an opt-in second pass.
+semantic_check:
+  enabled: true
+  threshold: 0.80 # cosine similarity to the nearest known-unsafe example; raise to reduce false positives, lower to catch more paraphrases
+  max_input_chars: 2000

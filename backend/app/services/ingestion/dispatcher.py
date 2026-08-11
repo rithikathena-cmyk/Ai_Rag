@@ -5,6 +5,7 @@ from app.services.ingestion import (
     docling_parser,
     metadata_extractor,
     plaintext_parser,
+    pymupdf_parser,
     sql_parser,
     structured_parser,
     tabular_parser,
@@ -13,7 +14,6 @@ from app.services.ingestion.detector import DocumentFormat, detect_format
 from app.services.ingestion.types import DocumentParsingError, NormalizedDocument, UnsupportedFormatError
 
 DOCLING_FORMATS = {
-    DocumentFormat.PDF,
     DocumentFormat.DOCX,
     DocumentFormat.PPTX,
     DocumentFormat.HTML,
@@ -27,7 +27,11 @@ def parse_document(file_path: Path, filename: str, content_type: str | None) -> 
         raise UnsupportedFormatError(filename)
 
     try:
-        if fmt in DOCLING_FORMATS:
+        if fmt == DocumentFormat.PDF:
+            # Docling's OCR fallback is disabled for now for speed — PyMuPDF
+            # only, even for scanned/low-text PDFs.
+            doc = pymupdf_parser.parse(file_path)
+        elif fmt in DOCLING_FORMATS:
             doc = docling_parser.parse(file_path, fmt)
         elif fmt in (DocumentFormat.MARKDOWN, DocumentFormat.TXT):
             doc = plaintext_parser.parse(file_path, fmt)

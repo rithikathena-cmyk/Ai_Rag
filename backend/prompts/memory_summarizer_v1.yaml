@@ -1,0 +1,11 @@
+name: memory_summarizer
+version: v1
+changelog:
+  - "v1: extracted from the inline prompt string built in services/memory/store.py::maybe_summarize(); the two dynamic sections (existing summary, new turns) became {existing_summary}/{new_turns} format placeholders, wording otherwise unchanged."
+text: |
+  Update the running summary of this conversation to include the new turns below. Keep it under 150 words. Preserve names, facts, decisions, and stated preferences. Write only the summary itself, with no preamble or meta-commentary.
+
+  Existing summary: {existing_summary}
+
+  New turns:
+  {new_turns}

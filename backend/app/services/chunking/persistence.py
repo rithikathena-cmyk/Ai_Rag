@@ -17,6 +17,8 @@ def build_chunk_rows(document_id: uuid.UUID, chunks: list[Chunk], embedding_mode
                 parent_chunk_id=parent_id,
                 text=c.text,
                 token_count=c.token_count,
+                chunk_size_tokens=c.chunk_size_tokens,
+                overlap_tokens=c.overlap_tokens,
                 strategy=c.strategy,
                 extra=c.extra,
                 qdrant_point_id=str(ids[i]),

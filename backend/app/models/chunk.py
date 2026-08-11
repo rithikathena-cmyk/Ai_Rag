@@ -21,6 +21,8 @@ class ChunkModel(Base):
     )
     text: Mapped[str] = mapped_column(Text, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chunk_size_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    overlap_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     strategy: Mapped[str] = mapped_column(String(64), nullable=False)
     extra: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     qdrant_point_id: Mapped[str | None] = mapped_column(String(64), nullable=True)

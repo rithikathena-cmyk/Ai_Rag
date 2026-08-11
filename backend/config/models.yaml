@@ -1,0 +1,69 @@
+# Claude Gateway model routing.
+#
+# `fast`/`sonnet` and `reasoning`/`opus` are the same tier under two names:
+# services/llm_rbac/engine.py resolves a role to `haiku`/`sonnet`/`opus` (per
+# backend/config/llm_rbac.yaml's per-role tiers_allowed — the role-based
+# model-access policy), and model_router.resolve() accepts either name for
+# the same config entry (see gateway/model_router.py). Callers that predate
+# LLM RBAC (generation_judge.py, memory/store.py) keep using `fast`/
+# `reasoning` directly, unaffected by this rename-that-isn't-a-rename.
+# `haiku` has no such fast/reasoning-style alias — it's role-driven only.
+tiers:
+  fast:
+    model: claude-opus-5
+    max_tokens: 4096
+    effort: medium
+  haiku:
+    # Cheapest/fastest role-driven tier — the only tier an Employee-role
+    # request can ever resolve to (backend/config/llm_rbac.yaml
+    # roles.user.model.tiers_allowed) since the role-model-access policy.
+    model: claude-haiku-4-5-20251001
+    max_tokens: 4096
+    effort: medium
+    # Verified live: this model rejects BOTH thinking={"type": "adaptive"}
+    # and output_config={"effort": ...} with their own 400 invalid_request_error
+    # ("adaptive thinking is not supported on this model" / "This model does
+    # not support the effort parameter") — sonnet/opus accept both fine.
+    # Without this flag, every Employee-role chat turn (the only role gated
+    # to this tier) fails and silently degrades to the raw-search fallback
+    # with a misleading "no AI model configured" message — see
+    # gateway/claude_gateway.py.
+    supports_extended_reasoning: false
+  sonnet:
+    # Mid tier — HR's ceiling, Project Manager's floor
+    # (backend/config/llm_rbac.yaml's per-role tiers_allowed).
+    model: claude-sonnet-5
+    max_tokens: 4096
+    effort: medium
+  reasoning:
+    # Complex planning / multi-step reasoning.
+    model: claude-opus-5
+    max_tokens: 4096
+    effort: high
+  opus:
+    # High-capability tier for HR/PM action-based escalation and CEO/Admin
+    # dynamic routing (backend/config/llm_rbac.yaml). Same model as
+    # `reasoning` — kept as separate config keys so gateway callers can use
+    # whichever name matches their own vocabulary (capability tier vs. model
+    # family) without the two ever drifting apart if one is repointed later.
+    model: claude-opus-5
+    max_tokens: 4096
+    effort: high
+
+default_tier: fast
+
+# Approximate list pricing per model, used only for the cost_usd estimate
+# usage_tracker.py attaches to each logged call — not billing-accurate,
+# just enough for relative cost tracking in the admin dashboard. Update
+# these to match your actual Anthropic pricing agreement.
+pricing:
+  claude-opus-5:
+    input_per_million_usd: 15.0
+    output_per_million_usd: 75.0
+  claude-sonnet-5:
+    input_per_million_usd: 3.0
+    output_per_million_usd: 15.0
+  claude-haiku-4-5-20251001:
+    input_per_million_usd: 0.80
+    output_per_million_usd: 4.0
+

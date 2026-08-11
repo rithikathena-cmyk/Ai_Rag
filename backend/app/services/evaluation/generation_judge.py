@@ -1,57 +1,45 @@
 import json
 
-import anthropic
+from app.gateway.claude_gateway import GenerationError, claude_gateway
+from app.gateway.prompt_manager import load_prompt
+from app.gateway.schemas import GenerateRequest, ModelTier
 
-from app.core.config import settings
-from app.services.generation.client import get_client
-from app.services.monitoring.metrics import record_token_usage
-
-JUDGE_SYSTEM_PROMPT = """You are a strict evaluator of RAG (retrieval-augmented generation) answers.
-Given a question, the source passages that were retrieved for it, and a generated answer, score the answer.
-
-Respond with ONLY a JSON object, no other text, in exactly this shape:
-{
-  "groundedness": <float 0-1, how well the answer's claims are supported by the sources>,
-  "faithfulness": <float 0-1, how free the answer is from contradicting the sources>,
-  "total_claims": <int, number of distinct factual claims made in the answer>,
-  "hallucinated_claims": <int, number of those claims NOT supported by any source>,
-  "notes": <one or two sentence explanation of the scores>
-}
-
-If the answer declines to answer or states it lacks enough information, set total_claims and
-hallucinated_claims to 0, and score groundedness/faithfulness based on whether that refusal was
-actually warranted given the sources."""
+JUDGE_SYSTEM_PROMPT = load_prompt("judge_agent", "v2").text
 
 
 class JudgeError(Exception):
     pass
 
 
-def judge_answer(question: str, answer: str, sources: list[str]) -> dict:
+def judge_answer(question: str, answer: str, sources: list[str], *, request_id: str | None = None) -> dict:
+    """`request_id`, when supplied, is threaded into the underlying gateway
+    call so this judge call's token usage lands in gateway_usage_logs under
+    the same request_id as the rest of an evaluation run (see
+    services/evaluation/runner.py) — reusing the existing gateway audit
+    trail as the source of truth for tokens/cost/model, rather than a second
+    tracking mechanism."""
     sources_block = "\n\n".join(f"[{i + 1}] {s}" for i, s in enumerate(sources)) or "(no sources were retrieved)"
     user_message = f"Question: {question}\n\nRetrieved sources:\n{sources_block}\n\nGenerated answer:\n{answer}"
 
     try:
-        response = get_client().messages.create(
-            model=settings.claude_model_name,
-            max_tokens=500,
-            thinking={"type": "adaptive"},
-            output_config={"effort": settings.claude_effort},
-            system=JUDGE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+        result = claude_gateway.generate(
+            GenerateRequest(
+                agent_name="eval_judge",
+                system=JUDGE_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+                tier=ModelTier.FAST,
+                max_tokens=500,
+                request_id=request_id,
+                cache_system=True,
+            )
         )
-    except anthropic.APIError as exc:
+    except GenerationError as exc:
         raise JudgeError(str(exc)) from exc
 
-    if response.usage:
-        record_token_usage(
-            "eval_judge", settings.claude_model_name, response.usage.input_tokens, response.usage.output_tokens
-        )
-
-    if response.stop_reason == "refusal":
+    if result.stop_reason == "refusal":
         raise JudgeError("Judge model refused to score this answer")
 
-    text = "".join(block.text for block in response.content if block.type == "text").strip()
+    text = result.text.strip()
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
@@ -71,5 +59,10 @@ def judge_answer(question: str, answer: str, sources: list[str]) -> dict:
         "hallucination_rate": hallucination_rate,
         "total_claims": total_claims,
         "hallucinated_claims": hallucinated_claims,
+        # New in v2 — see judge_agent_v2.yaml. Absent/malformed on an older
+        # cached result or a judge response that skips the field defaults to
+        # 0.0 rather than raising, matching every other score's handling above.
+        "citation_accuracy": float(data.get("citation_accuracy", 0.0)),
+        "answer_relevance": float(data.get("answer_relevance", 0.0)),
         "notes": str(data.get("notes", "")),
     }

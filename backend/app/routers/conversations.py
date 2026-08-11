@@ -6,11 +6,25 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
+from app.core.permissions import Permission
 from app.db.postgres import get_db
 from app.models.conversation import ConversationModel
-from app.services.memory.store import get_conversation, list_messages
+from app.models.user import UserModel
+from app.services.auth.dependencies import get_current_user
+from app.services.auth.rbac import require_permission
+from app.services.memory.store import (
+    BROAD_CONVERSATION_VISIBILITY_ROLES,
+    authorize_conversation_access,
+    get_conversation,
+    list_messages,
+)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_permission(Permission.VIEW_CONVERSATIONS))])
+
+# Every role gets VIEW_CONVERSATIONS (see llm_rbac.yaml) — the router-level
+# dependency above just establishes "logged in with that base permission";
+# the actual scoping (own conversations only, unless CEO/Admin) happens per
+# route below, since VIEW_CONVERSATIONS alone doesn't imply "see everyone's."
 
 
 class ConversationSummary(BaseModel):
@@ -54,8 +68,15 @@ def _to_summary(row: ConversationModel) -> ConversationSummary:
 
 @router.get("/conversations", response_model=ConversationListResponse)
 def list_conversations(
-    user_id: uuid.UUID | None = None, limit: int = 50, offset: int = 0, db: Session = Depends(get_db)
+    user_id: uuid.UUID | None = None, limit: int = 50, offset: int = 0, db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
 ):
+    # Previously had no auth at all — an unfiltered request (no user_id)
+    # listed every user's conversations. A non-privileged caller is now
+    # forced to their own id regardless of what they pass; only CEO/Admin
+    # may query an arbitrary user_id or leave it unfiltered.
+    if current_user.role not in BROAD_CONVERSATION_VISIBILITY_ROLES:
+        user_id = current_user.id
     query = db.query(ConversationModel)
     if user_id is not None:
         query = query.filter(ConversationModel.user_id == user_id)
@@ -66,10 +87,15 @@ def list_conversations(
 
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationDetailResponse)
-def get_conversation_detail(conversation_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_conversation_detail(
+    conversation_id: uuid.UUID, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)
+):
+    # Previously unauthenticated — anyone could read any conversation's full
+    # message history (including any generated report payloads) by ID.
     row = get_conversation(db, conversation_id)
     if row is None:
         raise AppError(404, "conversation_not_found", f"Conversation {conversation_id} not found")
+    authorize_conversation_access(row, current_user)
     messages = list_messages(db, conversation_id)
     return ConversationDetailResponse(
         **_to_summary(row).model_dump(),
@@ -84,9 +110,13 @@ def get_conversation_detail(conversation_id: uuid.UUID, db: Session = Depends(ge
 
 
 @router.delete("/conversations/{conversation_id}", status_code=204)
-def delete_conversation(conversation_id: uuid.UUID, db: Session = Depends(get_db)):
+def delete_conversation(
+    conversation_id: uuid.UUID, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)
+):
+    # Previously unauthenticated — anyone could delete any user's conversation.
     row = get_conversation(db, conversation_id)
     if row is None:
         raise AppError(404, "conversation_not_found", f"Conversation {conversation_id} not found")
+    authorize_conversation_access(row, current_user)
     db.delete(row)
     db.commit()

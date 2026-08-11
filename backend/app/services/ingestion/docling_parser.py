@@ -16,6 +16,17 @@ def _get_converter():
     return _converter
 
 
+def warm() -> None:
+    """Loads Docling's PDF pipeline (layout, table structure, OCR models) once at
+    process startup instead of on the first upload. Without this, the first
+    PDF/DOCX/PPTX/HTML/image upload pays for both the HF Hub download and the
+    CPU model init inline — easily several minutes — and can blow past a
+    client's upload timeout even though the parse itself would succeed."""
+    from docling.datamodel.base_models import InputFormat
+
+    _get_converter().initialize_pipeline(InputFormat.PDF)
+
+
 def _to_normalized_table(index: int, table, dl_doc) -> NormalizedTable:
     try:
         df = table.export_to_dataframe(dl_doc)
@@ -46,7 +57,7 @@ def _to_normalized_image(index: int, picture, dl_doc) -> NormalizedImage | None:
         return None
 
 
-def _extract_container_metadata(file_path: Path, fmt: DocumentFormat) -> tuple[str | None, str | None, datetime | None, datetime | None]:
+def extract_container_metadata(file_path: Path, fmt: DocumentFormat) -> tuple[str | None, str | None, datetime | None, datetime | None]:
     title = author = None
     creation_date = modified_date = None
     try:
@@ -104,7 +115,7 @@ def parse(file_path: Path, fmt: DocumentFormat) -> NormalizedDocument:
     except Exception:
         pass
 
-    title, author, creation_date, modified_date = _extract_container_metadata(file_path, fmt)
+    title, author, creation_date, modified_date = extract_container_metadata(file_path, fmt)
     if not title:
         title = headings[0] if headings else file_path.stem
 

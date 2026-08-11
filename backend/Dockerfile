@@ -12,6 +12,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 
 COPY app ./app
+COPY config ./config
+COPY prompts ./prompts
 
 ENV OMP_NUM_THREADS=4
 

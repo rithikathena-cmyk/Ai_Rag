@@ -4,9 +4,14 @@ __pycache__/
 .venv/
 backend/document_storage/
 backend/report_storage/
+/document_storage/
+/report_storage/
 *.log
 qdrant-bin/
 storage/
 snapshots/
 .qdrant-initialized
 .claude/settings.local.json
+backend/scripts/seeded_users.csv
+backend/scripts/seeded_users.xlsx
+.playwright-mcp/

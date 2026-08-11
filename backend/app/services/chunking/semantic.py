@@ -11,7 +11,8 @@ def chunk(parsed, config, strategy_name: str = "semantic") -> list[Chunk]:
         return []
     if len(sentences) == 1:
         return [Chunk(index=0, text=sentences[0], strategy=strategy_name,
-                       token_count=text_utils.count_tokens(sentences[0]))]
+                       token_count=text_utils.count_tokens(sentences[0]),
+                       chunk_size_tokens=config.chunk_size_tokens, overlap_tokens=0)]
 
     vectors = np.array(embed_texts(sentences))
 
@@ -35,7 +36,8 @@ def chunk(parsed, config, strategy_name: str = "semantic") -> list[Chunk]:
             chunks[-1].text += " " + text
             chunks[-1].token_count = text_utils.count_tokens(chunks[-1].text)
             continue
-        chunks.append(Chunk(index=len(chunks), text=text, strategy=strategy_name, token_count=text_utils.count_tokens(text)))
+        chunks.append(Chunk(index=len(chunks), text=text, strategy=strategy_name, token_count=text_utils.count_tokens(text),
+                             chunk_size_tokens=config.chunk_size_tokens, overlap_tokens=0))
 
     for i, c in enumerate(chunks):
         c.index = i

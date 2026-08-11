@@ -104,6 +104,8 @@ def generate_report(
     fmt: Literal["csv", "xlsx", "docx", "pdf"],
     columns: list[str],
     rows: list[list],
+    owner_id: uuid.UUID | None = None,
+    department: str | None = None,
 ) -> ReportModel:
     if fmt not in REPORT_FORMATS:
         raise ReportAgentError(f"Unsupported report format: {fmt}")
@@ -119,7 +121,10 @@ def generate_report(
 
     _WRITERS[fmt](path, title, columns, rows)
 
-    row_model = ReportModel(id=report_id, title=title, format=fmt, file_path=str(path), row_count=len(rows))
+    row_model = ReportModel(
+        id=report_id, title=title, format=fmt, file_path=str(path), row_count=len(rows),
+        owner_id=owner_id, department=department,
+    )
     db.add(row_model)
     db.commit()
     db.refresh(row_model)

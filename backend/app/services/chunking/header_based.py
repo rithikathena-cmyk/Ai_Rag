@@ -1,33 +1,9 @@
-import re
-
 from app.services.chunking import text_utils
 from app.services.chunking.types import Chunk
 
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
-
-
-def _split_sections(text: str) -> list[tuple[str, str]]:
-    matches = list(_HEADING_RE.finditer(text))
-    if not matches:
-        return [("", text)] if text.strip() else []
-
-    sections: list[tuple[str, str]] = []
-    if matches[0].start() > 0:
-        preamble = text[: matches[0].start()].strip()
-        if preamble:
-            sections.append(("", preamble))
-
-    for i, m in enumerate(matches):
-        heading = m.group(2).strip()
-        start = m.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        sections.append((heading, text[start:end].strip()))
-
-    return sections
-
 
 def chunk(parsed, config) -> list[Chunk]:
-    sections = _split_sections(parsed.text)
+    sections = text_utils.split_sections(parsed.text)
     if not sections:
         return []
 
@@ -43,6 +19,8 @@ def chunk(parsed, config) -> list[Chunk]:
                 text=section_text,
                 strategy="header_based",
                 token_count=section_tokens,
+                chunk_size_tokens=config.chunk_size_tokens,
+                overlap_tokens=0,
                 extra={"heading": heading} if heading else {},
             )
         )
@@ -59,6 +37,8 @@ def chunk(parsed, config) -> list[Chunk]:
                         strategy="header_based",
                         parent_index=section_index,
                         token_count=text_utils.count_tokens(child_text),
+                        chunk_size_tokens=config.chunk_size_tokens,
+                        overlap_tokens=config.chunk_overlap_tokens,
                         extra={"heading": heading, "role": "child"} if heading else {"role": "child"},
                     )
                 )

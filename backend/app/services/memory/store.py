@@ -1,13 +1,22 @@
 import uuid
 
-import anthropic
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.errors import AppError
+from app.core.roles import Role
+from app.gateway.claude_gateway import GenerationError, claude_gateway
+from app.gateway.prompt_manager import load_prompt
+from app.gateway.schemas import GenerateRequest, ModelTier
 from app.models.conversation import ConversationModel
 from app.models.message import MessageModel
-from app.services.generation.client import GenerationError, get_client
-from app.services.monitoring.metrics import record_token_usage
+from app.models.user import UserModel
+
+# Only a conversation's own owner, or a CEO/Admin, may read/continue/delete it
+# (routers/conversations.py's list/detail/delete endpoints, and routers/
+# chat.py's conversation_id-continuation path, all enforce this same rule via
+# authorize_conversation_access() below).
+BROAD_CONVERSATION_VISIBILITY_ROLES = {Role.CEO.value, Role.ADMIN.value}
 
 
 def create_conversation(db: Session, *, user_id: uuid.UUID | None = None) -> ConversationModel:
@@ -20,6 +29,20 @@ def create_conversation(db: Session, *, user_id: uuid.UUID | None = None) -> Con
 
 def get_conversation(db: Session, conversation_id: uuid.UUID) -> ConversationModel | None:
     return db.get(ConversationModel, conversation_id)
+
+
+def authorize_conversation_access(conversation: ConversationModel, user: UserModel) -> None:
+    """Raises 404 (not 403 — avoids confirming a conversation id exists to a
+    caller who can't see it) unless `user` owns `conversation` or holds a
+    broad-visibility role. Centralized here — not left as a routers/
+    conversations.py-only check — specifically so routers/chat.py's
+    conversation_id continuation path can't be used to hijack (read from,
+    or append messages/context into) another user's conversation just by
+    supplying its id in a /chat request body."""
+    if user.role in BROAD_CONVERSATION_VISIBILITY_ROLES:
+        return
+    if conversation.user_id != user.id:
+        raise AppError(404, "conversation_not_found", "Conversation not found")
 
 
 def list_messages(db: Session, conversation_id: uuid.UUID) -> list[MessageModel]:
@@ -69,7 +92,10 @@ def build_context(db: Session, conversation_id: uuid.UUID) -> tuple[str | None, 
     return convo.summary, history
 
 
-def maybe_summarize(db: Session, conversation_id: uuid.UUID) -> None:
+def maybe_summarize(
+    db: Session, conversation_id: uuid.UUID, *,
+    user_id: uuid.UUID | None = None, role: str | None = None, department: str | None = None,
+) -> None:
     convo = db.get(ConversationModel, conversation_id)
     if convo is None or (convo.message_count or 0) < settings.conversation_summary_trigger_turns:
         return
@@ -81,35 +107,27 @@ def maybe_summarize(db: Session, conversation_id: uuid.UUID) -> None:
         return
 
     transcript = "\n".join(f"{m.role}: {m.content}" for m in to_fold)
-    prompt = (
-        "Update the running summary of this conversation to include the new turns below. "
-        "Keep it under 150 words. Preserve names, facts, decisions, and stated preferences. "
-        "Write only the summary itself, with no preamble or meta-commentary.\n\n"
-        f"Existing summary: {convo.summary or '(none yet)'}\n\n"
-        f"New turns:\n{transcript}"
-    )
-    try:
-        response = get_client().messages.create(
-            model=settings.claude_model_name,
-            max_tokens=settings.memory_summary_max_tokens,
-            thinking={"type": "adaptive"},
-            output_config={"effort": settings.memory_summary_effort},
+    prompt_template = load_prompt("memory_summarizer", "v1")
+    prompt = prompt_template.text.format(existing_summary=convo.summary or "(none yet)", new_turns=transcript)
+
+    result = claude_gateway.generate(
+        GenerateRequest(
+            agent_name="conversation_summary",
+            system="",
             messages=[{"role": "user", "content": prompt}],
+            tier=ModelTier.FAST,
+            max_tokens=settings.memory_summary_max_tokens,
+            effort=settings.memory_summary_effort,
+            user_id=user_id,
+            role=role,
+            department=department,
         )
-    except anthropic.APIError as exc:
-        raise GenerationError(str(exc)) from exc
+    )  # GenerationError propagates to the caller, same as before this migration
 
-    if response.usage:
-        record_token_usage(
-            "conversation_summary", settings.claude_model_name,
-            response.usage.input_tokens, response.usage.output_tokens,
-        )
-
-    if response.stop_reason == "refusal":
+    if result.stop_reason == "refusal":
         return
 
-    summary_text = "".join(b.text for b in response.content if b.type == "text")
-    if summary_text:
-        convo.summary = summary_text
+    if result.text:
+        convo.summary = result.text
         convo.summarized_count = fold_upto
         db.commit()

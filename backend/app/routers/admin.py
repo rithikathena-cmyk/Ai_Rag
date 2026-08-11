@@ -1,15 +1,36 @@
+from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from qdrant_client.models import Distance, VectorParams
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.errors import AppError
+from app.core.permissions import Permission
+from app.db.postgres import get_db
 from app.db.qdrant import get_qdrant_client
-from app.services.monitoring.metrics import get_latencies, get_token_usage
+from app.gateway import availability
+from app.models.gateway_usage_log import GatewayUsageLogModel
+from app.services.auth.rbac import require_permission
+from app.services.ingestion.consistency import check_all_documents
+from app.services.llm_rbac import policy_loader
+from app.services.monitoring.metrics import (
+    get_guardrail_events, get_ingestion_metrics, get_latencies, get_retrieval_errors, get_retrieval_metrics,
+    get_token_usage,
+)
 
+# Was a blanket require_role(ADMIN) for every route in this file. Split per
+# the enterprise permission matrix: the Qdrant-collections/model-availability
+# routes are real system configuration (SYSTEM_SETTINGS, Admin-only); the
+# operational-metrics routes (latency/tokens/gateway-cost/guardrails) are
+# platform-ops analytics (VIEW_ANALYTICS, CEO+Admin — see individual route
+# dependencies below, since the two groups now differ).
 router = APIRouter(prefix="/admin", tags=["admin"])
+_settings_only = [Depends(require_permission(Permission.SYSTEM_SETTINGS))]
+_analytics = [Depends(require_permission(Permission.VIEW_ANALYTICS))]
 
 _DISTANCE_MAP = {"Cosine": Distance.COSINE, "Euclid": Distance.EUCLID, "Dot": Distance.DOT}
 
@@ -37,14 +58,14 @@ def _to_response(client, name: str) -> CollectionResponse:
     )
 
 
-@router.get("/collections", response_model=list[CollectionResponse])
+@router.get("/collections", response_model=list[CollectionResponse], dependencies=_settings_only)
 def list_collections():
     client = get_qdrant_client()
     names = [c.name for c in client.get_collections().collections]
     return [_to_response(client, name) for name in names]
 
 
-@router.post("/collections", response_model=CollectionResponse, status_code=201)
+@router.post("/collections", response_model=CollectionResponse, status_code=201, dependencies=_settings_only)
 def create_collection(body: CollectionCreateRequest):
     client = get_qdrant_client()
     if client.collection_exists(body.name):
@@ -56,7 +77,7 @@ def create_collection(body: CollectionCreateRequest):
     return _to_response(client, body.name)
 
 
-@router.delete("/collections/{name}", status_code=204)
+@router.delete("/collections/{name}", status_code=204, dependencies=_settings_only)
 def delete_collection(name: str):
     if name == settings.qdrant_collection_name:
         raise AppError(
@@ -67,6 +88,63 @@ def delete_collection(name: str):
     if not client.collection_exists(name):
         raise AppError(404, "collection_not_found", f"Collection '{name}' not found")
     client.delete_collection(collection_name=name)
+
+
+class IndexConsistencyItem(BaseModel):
+    document_id: str
+    filename: str
+    postgres_chunk_count: int
+    qdrant_point_count: int
+
+
+class IndexConsistencyResponse(BaseModel):
+    checked: int
+    inconsistent: list[IndexConsistencyItem]
+
+
+@router.get("/index-consistency", response_model=IndexConsistencyResponse, dependencies=_settings_only)
+def get_index_consistency(db: Session = Depends(get_db)):
+    """Flags any document whose Postgres chunk count doesn't match its
+    actual Qdrant point count — e.g. status="completed" but zero points,
+    which the ingestion path itself has no way to detect after the fact
+    (see services/ingestion/consistency.py's module docstring for why: it's
+    not a code bug in the upload/reindex flow, it's drift between two
+    independently-lifecycled stores). Fix a flagged document via the
+    existing POST /documents/{id}/reindex — never by writing to Qdrant
+    directly from here."""
+    reports = check_all_documents(db)
+    inconsistent = [r for r in reports if not r.consistent]
+    return IndexConsistencyResponse(
+        checked=len(reports),
+        inconsistent=[
+            IndexConsistencyItem(
+                document_id=str(r.document_id), filename=r.filename,
+                postgres_chunk_count=r.postgres_chunk_count, qdrant_point_count=r.qdrant_point_count,
+            )
+            for r in inconsistent
+        ],
+    )
+
+
+class ModelAvailabilityResponse(BaseModel):
+    disabled: bool
+
+
+@router.get("/model-availability", response_model=ModelAvailabilityResponse, dependencies=_settings_only)
+def get_model_availability():
+    return ModelAvailabilityResponse(disabled=availability.is_disabled())
+
+
+@router.put("/model-availability", response_model=ModelAvailabilityResponse, dependencies=_settings_only)
+def set_model_availability(body: ModelAvailabilityResponse):
+    """Admin-only testing toggle (gateway/availability.py) — forces every
+    Claude call to fail with GenerationError so routers/chat.py's degraded
+    retrieval-fallback path, and the chat UI's "try a different model" retry
+    button, can be demonstrated on demand without touching the real
+    ANTHROPIC_API_KEY. Process-local: resets on backend restart, not
+    persisted, not shared across multiple workers/instances."""
+    availability.set_disabled(body.disabled)
+    return ModelAvailabilityResponse(disabled=availability.is_disabled())
 
 
 class LatencySummary(BaseModel):
@@ -91,7 +169,7 @@ class MetricsResponse(BaseModel):
     token_usage_summary: list[TokenUsageSummary]
 
 
-@router.get("/metrics", response_model=MetricsResponse)
+@router.get("/metrics", response_model=MetricsResponse, dependencies=_analytics)
 def get_metrics():
     latencies = get_latencies()
     tokens = get_token_usage()
@@ -129,3 +207,193 @@ def get_metrics():
         token_usage_samples=tokens[-200:],
         token_usage_summary=token_usage_summary,
     )
+
+
+class QueryMetricsResponse(BaseModel):
+    retrieval_samples: list[dict]
+    ingestion_samples: list[dict]
+    retrieval_error_samples: list[dict]
+
+
+@router.get("/query-metrics", response_model=QueryMetricsResponse, dependencies=_analytics)
+def get_query_metrics():
+    """Per-query stage-timing breakdowns for the metrics dashboard — raw
+    samples only (retrieval: filter/embed/sparse/qdrant/rerank/total per
+    search call; ingestion: parse/summarize/entity/chunk/tokenize/
+    embed/sparse/sparse_index/total per upload; retrieval_error_samples:
+    infra failures — Qdrant/Postgres unavailable, reranker crash — caught
+    along the retrieval path). Aggregation, trend charts, and suggestions are
+    computed frontend-side from these."""
+    return QueryMetricsResponse(
+        retrieval_samples=get_retrieval_metrics()[-200:],
+        ingestion_samples=get_ingestion_metrics()[-200:],
+        retrieval_error_samples=get_retrieval_errors()[-200:],
+    )
+
+
+class GatewayUsageSample(BaseModel):
+    request_id: str
+    agent_name: str
+    model: str
+    tier: str
+    tokens_input: int
+    tokens_output: int
+    latency_ms: float
+    cost_usd: float
+    created_at: datetime
+
+
+class GatewayUsageSummaryRow(BaseModel):
+    agent_name: str
+    model: str
+    tier: str
+    call_count: int
+    total_tokens_input: int
+    total_tokens_output: int
+    total_cost_usd: float
+    avg_latency_ms: float
+
+
+class GatewayUsageResponse(BaseModel):
+    samples: list[GatewayUsageSample]
+    summary: list[GatewayUsageSummaryRow]
+    total_cost_usd: float
+
+
+@router.get("/gateway-usage", response_model=GatewayUsageResponse, dependencies=_analytics)
+def get_gateway_usage(limit: int = 200, db: Session = Depends(get_db)):
+    """Claude Gateway call history: which agent called which model/tier, at
+    what cost. Summary is aggregated over the FULL table (not just the
+    returned sample window) since gateway_usage_logs is a real, unbounded
+    Postgres table, unlike the in-memory metrics below."""
+    rows = (
+        db.query(GatewayUsageLogModel)
+        .order_by(GatewayUsageLogModel.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    samples = [
+        GatewayUsageSample(
+            request_id=r.request_id, agent_name=r.agent_name, model=r.model, tier=r.tier,
+            tokens_input=r.tokens_input, tokens_output=r.tokens_output,
+            latency_ms=r.latency_ms, cost_usd=r.cost_usd, created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+    summary_rows = (
+        db.query(
+            GatewayUsageLogModel.agent_name,
+            GatewayUsageLogModel.model,
+            GatewayUsageLogModel.tier,
+            func.count(GatewayUsageLogModel.id),
+            func.sum(GatewayUsageLogModel.tokens_input),
+            func.sum(GatewayUsageLogModel.tokens_output),
+            func.sum(GatewayUsageLogModel.cost_usd),
+            func.avg(GatewayUsageLogModel.latency_ms),
+        )
+        .group_by(GatewayUsageLogModel.agent_name, GatewayUsageLogModel.model, GatewayUsageLogModel.tier)
+        .all()
+    )
+    summary = [
+        GatewayUsageSummaryRow(
+            agent_name=agent_name, model=model, tier=tier, call_count=call_count,
+            total_tokens_input=total_in or 0, total_tokens_output=total_out or 0,
+            total_cost_usd=total_cost or 0.0, avg_latency_ms=avg_latency or 0.0,
+        )
+        for agent_name, model, tier, call_count, total_in, total_out, total_cost, avg_latency in summary_rows
+    ]
+    summary.sort(key=lambda s: s.total_cost_usd, reverse=True)
+
+    total_cost = db.query(func.sum(GatewayUsageLogModel.cost_usd)).scalar() or 0.0
+    return GatewayUsageResponse(samples=samples, summary=summary, total_cost_usd=total_cost)
+
+
+class GuardrailEventSample(BaseModel):
+    direction: str
+    check: str
+    action: str
+    detail: str
+    created_at: float
+
+
+class GuardrailCheckSummary(BaseModel):
+    direction: str
+    check: str
+    pass_count: int
+    redact_count: int
+    block_count: int
+
+
+class GuardrailAnalyticsResponse(BaseModel):
+    events: list[GuardrailEventSample]
+    summary: list[GuardrailCheckSummary]
+
+
+@router.get("/guardrail-analytics", response_model=GuardrailAnalyticsResponse, dependencies=_analytics)
+def get_guardrail_analytics():
+    """Pass/redact/block counts per check (input: length/injection/destructive/
+    scope/pii, output: system_prompt_leak/pii/output_citation_check), plus the
+    raw recent event log — same in-memory store every guardrail step already
+    writes to (services/monitoring/metrics.py::record_guardrail_event), just
+    not previously exposed through any endpoint."""
+    events = get_guardrail_events()
+
+    by_check: dict[tuple[str, str], dict[str, int]] = {}
+    for e in events:
+        agg = by_check.setdefault((e["direction"], e["check"]), {"pass": 0, "redact": 0, "block": 0})
+        if e["action"] in agg:
+            agg[e["action"]] += 1
+    summary = [
+        GuardrailCheckSummary(
+            direction=direction, check=check,
+            pass_count=counts["pass"], redact_count=counts["redact"], block_count=counts["block"],
+        )
+        for (direction, check), counts in sorted(by_check.items())
+    ]
+
+    return GuardrailAnalyticsResponse(events=events[-200:], summary=summary)
+
+
+class RoleSummary(BaseModel):
+    role: str
+    display_name: str
+    department_default: str | None
+    tiers_allowed: list[str]
+    knowledge_departments: list[str]
+    tools: list[str]
+    granted_permissions: list[str]
+    all_permissions: bool
+    quotas: dict
+
+
+class RolesResponse(BaseModel):
+    roles: list[RoleSummary]
+
+
+@router.get("/roles", response_model=RolesResponse, dependencies=[Depends(require_permission(Permission.VIEW_ROLES))])
+def list_roles():
+    """Read-only summary of every role's permission/tool/quota configuration
+    (backend/config/llm_rbac.yaml, via policy_loader) — the Roles &
+    Permissions admin view. Live editing of role definitions is a materially
+    bigger feature (a dynamic config store instead of a static YAML file, an
+    admin UI for authoring RBAC changes safely) and is out of scope here;
+    MANAGE_ROLES exists in the permission catalog for when that's built, but
+    nothing calls it yet."""
+    summaries = []
+    for role in policy_loader.all_roles():
+        cfg = policy_loader.role_config(role)
+        summaries.append(RoleSummary(
+            role=cfg.role,
+            display_name=cfg.display_name,
+            department_default=cfg.department_default,
+            tiers_allowed=sorted(cfg.tiers_allowed),
+            knowledge_departments=list(cfg.knowledge_departments),
+            tools=sorted(cfg.tools),
+            granted_permissions=(
+                sorted(p.value for p in Permission) if "*" in cfg.granted_permissions else sorted(cfg.granted_permissions)
+            ),
+            all_permissions="*" in cfg.granted_permissions,
+            quotas=cfg.quotas,
+        ))
+    return RolesResponse(roles=summaries)

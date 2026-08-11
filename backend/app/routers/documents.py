@@ -1,37 +1,63 @@
+import asyncio
 import shutil
+import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.errors import AppError
+from app.core.permissions import Permission
 from app.db.postgres import get_db
+from app.gateway.usage_tracker import record_denied
+from app.models.approval_request import ApprovalRequestModel
 from app.models.chunk import ChunkModel
 from app.models.chunk_term_frequency import ChunkTermFrequencyModel
-from app.models.document import Document
+from app.models.document import DocumentModel
 from app.models.entity import EntityModel
 from app.models.permission import PermissionModel
 from app.models.upload_log import UploadLogModel
 from app.models.user import UserModel
+from app.services.auth.dependencies import get_current_user
+from app.services.auth.rbac import require_permission
+from app.services.chunking import text_utils
 from app.services.chunking.dispatcher import chunk_document
 from app.services.chunking.persistence import build_chunk_rows
-from app.services.classification.classifier import classify
 from app.services.embedding.model_loader import embed_texts
 from app.services.embedding.qdrant_store import delete_document_points, upsert_chunks
 from app.services.entities.persistence import build_entity_rows
+from app.services.guardrails.retrieval_permissions import filter_by_category
 from app.services.ingestion import storage
 from app.services.ingestion.detector import detect_format
 from app.services.ingestion.dispatcher import parse_document
 from app.services.ingestion.types import DocumentParsingError
+from app.services.ingestion.upload_validation import validate_mime
+from app.services.llm_rbac import policy_loader
+from app.services.llm_rbac.engine import authorize_llm_request
+from app.services.monitoring import progress
+from app.services.monitoring.metrics import record_ingestion_metrics
 from app.services.sparse.service import build_sparse_index, compute_term_frequencies
 from app.services.summarization.extractive import summarize
 
 router = APIRouter()
+
+
+def _chunk_with_timing(parsed, fmt, file_extension):
+    # reset/read must happen on the SAME thread that runs chunk_document —
+    # the tokenize timer is thread-local, and run_in_threadpool hands this
+    # whole function to one worker thread as a unit, so bundling reset+call+
+    # read together here (rather than around the run_in_threadpool call from
+    # the caller's thread) is what makes the measurement land on the right thread.
+    text_utils.reset_tokenize_timer()
+    chunks = chunk_document(parsed, fmt, file_extension)
+    return chunks, text_utils.get_tokenize_time_ms()
 
 
 class DocumentMetadataResponse(BaseModel):
@@ -78,9 +104,13 @@ class ChunkResponse(BaseModel):
     parent_chunk_id: uuid.UUID | None
     text: str
     token_count: int
+    chunk_size_tokens: int | None
+    overlap_tokens: int | None
     strategy: str
     extra: dict | None
     keywords: list[str] | None
+    qdrant_point_id: str | None
+    embedding_model: str | None
 
 
 class DocumentVersionSummary(BaseModel):
@@ -117,7 +147,7 @@ class EntityResponse(BaseModel):
     mention_count: int
 
 
-def _to_response(row: Document) -> DocumentResponse:
+def _to_response(row: DocumentModel) -> DocumentResponse:
     return DocumentResponse(
         id=row.id,
         filename=row.filename,
@@ -183,11 +213,42 @@ def _log_upload(
 async def upload_document(
     file: UploadFile = File(...),
     previous_version_of: uuid.UUID | None = Form(None),
+    client_document_id: uuid.UUID | None = Form(None),
+    department: str | None = Form(None),
+    project: str | None = Form(None),
+    security_classification: str | None = Form(None),
     db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.UPLOAD_DOCUMENTS)),
 ):
+    # LLM RBAC gate — same pattern as routers/chat.py: a denial here is
+    # itself an auditable event, and must happen before any parsing/storage
+    # work starts. Employee's llm_rbac.yaml entry denies "upload_documents"
+    # explicitly; HR/Project Manager/CEO/Admin allow it. require_permission
+    # above is the coarse REST-permission gate (403 before this even runs,
+    # no audit row); this inline check is the fine-grained, audited one —
+    # both should always agree since rbac_permissions and permissions.allow/
+    # deny are kept in sync per role, but the coarse gate is cheaper (no
+    # Postgres round-trip) so it runs first.
+    try:
+        decision = authorize_llm_request(db, current_user, endpoint="documents", action="upload_documents")
+    except AppError as exc:
+        record_denied(
+            agent_name="documents_upload", user_id=current_user.id, role=current_user.role,
+            department=current_user.department, denial_reason=str(exc.detail),
+            requested_capability="upload_documents",
+        )
+        raise
+
+    # A caller may leave department unset — default to the uploader's own
+    # resolved department so apply_category_policy() has something to filter
+    # on immediately, rather than every upload landing in the
+    # visible-to-everyone NULL bucket (docs/KNOWLEDGE_ACCESS_CONTROL.md §5).
+    resolved_department = department or decision.department
+
     previous_doc = None
     if previous_version_of is not None:
-        previous_doc = db.get(Document, previous_version_of)
+        previous_doc = db.get(DocumentModel, previous_version_of)
         if previous_doc is None:
             _log_upload(
                 db, document_id=None, filename=file.filename, content_type=file.content_type,
@@ -214,6 +275,14 @@ async def upload_document(
         )
         raise AppError(400, "empty_file", "Uploaded file is empty")
 
+    if settings.upload_mime_check_enabled and not validate_mime(fmt, content):
+        _log_upload(
+            db, document_id=None, filename=file.filename, content_type=file.content_type,
+            file_size_bytes=len(content), outcome="rejected", error_code="mime_mismatch",
+            error_message=f"File content doesn't match its extension ({file.filename})",
+        )
+        raise AppError(415, "mime_mismatch", f"File content doesn't match its extension ({file.filename})")
+
     max_bytes = settings.max_upload_size_mb * 1024 * 1024
     if len(content) > max_bytes:
         _log_upload(
@@ -223,19 +292,48 @@ async def upload_document(
         )
         raise AppError(413, "file_too_large", f"File exceeds {settings.max_upload_size_mb}MB limit")
 
-    document_id = uuid.uuid4()
+    document_id = client_document_id or uuid.uuid4()
+    doc_id_str = str(document_id)
     doc_dir = storage.make_document_dir(document_id)
     original_path = storage.save_original(doc_dir, file.filename, content)
 
+    ingestion_stages: dict[str, float] = {}
+    progress.start(doc_id_str, file.filename)
+
+    async def _timed(key: str, fn, *args, timeout: float | None = None):
+        stage = key.removesuffix("_ms")
+        progress.begin_stage(doc_id_str, stage)
+        start = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(run_in_threadpool(fn, *args), timeout=timeout)
+        except TimeoutError:
+            raise TimeoutError(f"{key} exceeded {timeout}s timeout") from None
+        elapsed = (time.perf_counter() - start) * 1000
+        ingestion_stages[key] = elapsed
+        progress.end_stage(doc_id_str, stage, elapsed)
+        return result
+
     try:
-        parsed = await run_in_threadpool(parse_document, original_path, file.filename, file.content_type)
+        parsed = await _timed(
+            "parse_ms", parse_document, original_path, file.filename, file.content_type,
+            timeout=settings.parse_timeout_seconds,
+        )
     except DocumentParsingError as exc:
+        progress.finish(doc_id_str, "failed")
         _log_upload(
             db, document_id=None, filename=file.filename, content_type=file.content_type,
             file_size_bytes=len(content), outcome="rejected", error_code="parsing_failed",
             error_message=str(exc),
         )
         raise AppError(422, "parsing_failed", str(exc))
+    except TimeoutError as exc:
+        progress.finish(doc_id_str, "failed")
+        _log_upload(
+            db, document_id=None, filename=file.filename, content_type=file.content_type,
+            file_size_bytes=len(content), outcome="rejected", error_code="parsing_timeout",
+            error_message=str(exc),
+        )
+        raise AppError(422, "parsing_timeout", str(exc))
 
     text_path = storage.save_text(doc_dir, parsed.text)
     tables_dir = storage.save_tables(doc_dir, parsed.tables)
@@ -254,17 +352,38 @@ async def upload_document(
     summary_text = None
 
     try:
-        classification = await run_in_threadpool(classify, fmt, parsed.metadata, parsed.text, file.filename)
-        summary_text = await run_in_threadpool(summarize, parsed.text)
-        entity_rows = await run_in_threadpool(build_entity_rows, document_id, parsed.text)
-        chunks = await run_in_threadpool(chunk_document, parsed, fmt, classification, file_extension)
-        vectors = await run_in_threadpool(embed_texts, [c.text for c in chunks])
-        term_freqs = await run_in_threadpool(compute_term_frequencies, [c.text for c in chunks])
+        summary_text = await _timed("summarize_ms", summarize, parsed.text)
+        entity_rows = await _timed("entity_ms", build_entity_rows, document_id, parsed.text)
+
+        chunk_start = time.perf_counter()
+        progress.begin_stage(doc_id_str, "chunk")
+        try:
+            chunks, tokenize_ms = await asyncio.wait_for(
+                run_in_threadpool(_chunk_with_timing, parsed, fmt, file_extension),
+                timeout=settings.chunk_timeout_seconds,
+            )
+        except TimeoutError:
+            raise TimeoutError(f"chunking exceeded {settings.chunk_timeout_seconds}s timeout") from None
+        chunk_elapsed = (time.perf_counter() - chunk_start) * 1000
+        ingestion_stages["chunk_ms"] = chunk_elapsed
+        ingestion_stages["tokenize_ms"] = tokenize_ms
+        progress.end_stage(doc_id_str, "chunk", chunk_elapsed)
+
+        vectors = await _timed(
+            "embed_ms", embed_texts, [c.text for c in chunks], timeout=settings.embed_timeout_seconds
+        )
+        term_freqs = await _timed("sparse_ms", compute_term_frequencies, [c.text for c in chunks])
         chunk_rows = build_chunk_rows(document_id, chunks, settings.embedding_model_name)
+
+        sparse_index_start = time.perf_counter()
+        progress.begin_stage(doc_id_str, "sparse_index")
         tf_rows, sparse_vectors = build_sparse_index(db, chunk_rows, term_freqs)
+        sparse_index_elapsed = (time.perf_counter() - sparse_index_start) * 1000
+        ingestion_stages["sparse_index_ms"] = sparse_index_elapsed
+        progress.end_stage(doc_id_str, "sparse_index", sparse_index_elapsed)
     except Exception as exc:
         status = "degraded"
-        error_message = f"classification/chunking/embedding failed: {exc}"
+        error_message = f"chunking/embedding failed: {exc}"
         chunk_rows = []
         vectors = []
         tf_rows = []
@@ -275,7 +394,7 @@ async def upload_document(
     version_number = (previous_doc.version_number + 1) if previous_doc else 1
     previous_version_id = previous_doc.id if previous_doc else None
 
-    row = Document(
+    row = DocumentModel(
         id=document_id,
         filename=file.filename,
         file_extension=file_extension,
@@ -309,6 +428,10 @@ async def upload_document(
         version_number=version_number,
         previous_version_id=previous_version_id,
         is_latest_version=True,
+        department=resolved_department,
+        project=project,
+        security_classification=security_classification or "internal",
+        owner_id=current_user.id,
     )
     db.add(row)
     db.flush()
@@ -326,8 +449,11 @@ async def upload_document(
     db.refresh(row)
 
     if chunk_rows:
+        upsert_start = time.perf_counter()
+        progress.begin_stage(doc_id_str, "qdrant_upsert")
         try:
             await run_in_threadpool(upsert_chunks, chunk_rows, vectors, sparse_vectors)
+            progress.end_stage(doc_id_str, "qdrant_upsert", (time.perf_counter() - upsert_start) * 1000)
         except Exception as exc:
             row.status = "degraded"
             row.error_message = f"qdrant upsert failed: {exc}"
@@ -340,22 +466,80 @@ async def upload_document(
         error_code=None, error_message=row.error_message,
     )
 
+    ingestion_stages["total_ms"] = sum(ingestion_stages.values())
+    record_ingestion_metrics(file.filename, ingestion_stages, chunk_count=len(chunk_rows))
+    progress.finish(doc_id_str, row.status)
+
     return _to_response(row)
+
+
+class IngestionStageProgress(BaseModel):
+    status: str
+    elapsed_ms: float | None
+
+
+class IngestionProgressResponse(BaseModel):
+    filename: str
+    status: str
+    current_stage: str | None
+    started_at: float
+    stages: dict[str, IngestionStageProgress]
+
+
+@router.get("/documents/{document_id}/progress", response_model=IngestionProgressResponse)
+def get_ingestion_progress(document_id: uuid.UUID, current_user: UserModel = Depends(get_current_user)):
+    data = progress.get(str(document_id))
+    if data is None:
+        raise AppError(404, "progress_not_found", "No ingestion progress recorded for this document")
+    return data
 
 
 @router.get("/documents/{document_id}", response_model=DocumentResponse)
-def get_document(document_id: uuid.UUID, db: Session = Depends(get_db)):
-    row = db.get(Document, document_id)
+def get_document(
+    document_id: uuid.UUID, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.VIEW_DOCUMENTS)),
+):
+    row = db.get(DocumentModel, document_id)
     if row is None:
-        raise AppError(404, "document_not_found", f"Document {document_id} not found")
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
+    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
+    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     return _to_response(row)
 
 
-@router.delete("/documents/{document_id}", status_code=204)
-def delete_document(document_id: uuid.UUID, db: Session = Depends(get_db)):
-    row = db.get(Document, document_id)
+class DocumentTextResponse(BaseModel):
+    text: str
+
+
+@router.get("/documents/{document_id}/text", response_model=DocumentTextResponse)
+def get_document_text(
+    document_id: uuid.UUID, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.VIEW_DOCUMENTS)),
+):
+    row = db.get(DocumentModel, document_id)
     if row is None:
-        raise AppError(404, "document_not_found", f"Document {document_id} not found")
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
+    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
+    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
+    if not row.text_file_path:
+        raise AppError(404, "text_not_found", "No parsed text stored for this document")
+    try:
+        text = Path(row.text_file_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AppError(404, "text_not_found", f"Parsed text file is missing: {exc}")
+    return DocumentTextResponse(text=text)
+
+
+def delete_document_row(db: Session, document_id: uuid.UUID) -> None:
+    """The actual deletion, shared by delete_document() below (immediate
+    delete, when no approval is required) and routers/approvals.py's decide
+    endpoint (deferred delete, once a pending ApprovalRequestModel targeting
+    this document is approved)."""
+    row = db.get(DocumentModel, document_id)
+    if row is None:
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
 
     # Postgres cascades chunks/entities/permissions via existing FK
     # ondelete=CASCADE; upload_logs.document_id is ondelete=SET NULL, so the
@@ -369,14 +553,60 @@ def delete_document(document_id: uuid.UUID, db: Session = Depends(get_db)):
     db.commit()
 
 
+@router.delete("/documents/{document_id}")
+def delete_document(
+    document_id: uuid.UUID, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.DELETE_DOCUMENTS)),
+):
+    try:
+        decision = authorize_llm_request(db, current_user, endpoint="documents", action="delete_documents")
+    except AppError as exc:
+        record_denied(
+            agent_name="documents_delete", user_id=current_user.id, role=current_user.role,
+            department=current_user.department, denial_reason=str(exc.detail),
+            requested_capability="delete_documents",
+        )
+        raise
+
+    if db.get(DocumentModel, document_id) is None:
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
+
+    if decision.requires_approval:
+        # llm_rbac.yaml marks this role's delete as approval-gated (currently
+        # only project_manager) — queue a real ApprovalRequestModel a CEO/
+        # Admin can approve/reject via POST /approvals/{id}/decide
+        # (routers/approvals.py), rather than either silently allowing or
+        # hard-blocking with no way to ever proceed.
+        approval = ApprovalRequestModel(
+            action="delete_document", target_type="document", target_id=document_id,
+            requested_by=current_user.id, role=current_user.role, status="pending",
+        )
+        db.add(approval)
+        db.commit()
+        db.refresh(approval)
+        return JSONResponse(
+            status_code=202,
+            content={"approval_request_id": str(approval.id), "status": "pending"},
+        )
+
+    delete_document_row(db, document_id)
+    return Response(status_code=204)
+
+
 @router.post("/documents/{document_id}/reindex", response_model=DocumentResponse)
-async def reindex_document(document_id: uuid.UUID, db: Session = Depends(get_db)):
+async def reindex_document(
+    document_id: uuid.UUID, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.MANAGE_DOCUMENTS)),
+):
     """Recomputes embeddings and the sparse (BM25) index for a document's existing chunks and
     re-upserts them into Qdrant — e.g. after an embedding model change. Does not re-parse the
-    original file or change chunk boundaries; use re-upload for that."""
-    row = db.get(Document, document_id)
+    original file or change chunk boundaries; use re-upload for that.
+
+    Previously had no auth beyond get_current_user at all (any authenticated
+    user could reindex any document) — now requires MANAGE_DOCUMENTS."""
+    row = db.get(DocumentModel, document_id)
     if row is None:
-        raise AppError(404, "document_not_found", f"Document {document_id} not found")
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
 
     chunk_rows = (
         db.query(ChunkModel)
@@ -385,7 +615,7 @@ async def reindex_document(document_id: uuid.UUID, db: Session = Depends(get_db)
         .all()
     )
     if not chunk_rows:
-        raise AppError(422, "no_chunks", "Document has no chunks to reindex")
+        raise AppError(422, "no_chunks", "DocumentModel has no chunks to reindex")
 
     texts = [c.text for c in chunk_rows]
     try:
@@ -418,17 +648,34 @@ async def reindex_document(document_id: uuid.UUID, db: Session = Depends(get_db)
 
 
 @router.get("/documents", response_model=DocumentListResponse)
-def list_documents(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
-    query = db.query(Document).order_by(Document.created_at.desc())
+def list_documents(
+    limit: int = 50, offset: int = 0, db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.VIEW_DOCUMENTS)),
+):
+    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
+    if knowledge_departments is None:
+        query = db.query(DocumentModel)
+    else:
+        visible_ids = filter_by_category(db, None, current_user.role, knowledge_departments)
+        query = db.query(DocumentModel).filter(DocumentModel.id.in_(visible_ids))
+    query = query.order_by(DocumentModel.created_at.desc())
     total = query.count()
     rows = query.offset(offset).limit(limit).all()
     return DocumentListResponse(items=[_to_response(r) for r in rows], total=total)
 
 
 @router.get("/documents/{document_id}/chunks", response_model=list[ChunkResponse])
-def get_document_chunks(document_id: uuid.UUID, limit: int = 200, offset: int = 0, db: Session = Depends(get_db)):
-    if db.get(Document, document_id) is None:
-        raise AppError(404, "document_not_found", f"Document {document_id} not found")
+def get_document_chunks(
+    document_id: uuid.UUID, limit: int = 200, offset: int = 0, db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.VIEW_DOCUMENTS)),
+):
+    if db.get(DocumentModel, document_id) is None:
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
+    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
+    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     rows = (
         db.query(ChunkModel)
         .filter(ChunkModel.document_id == document_id)
@@ -444,23 +691,36 @@ def get_document_chunks(document_id: uuid.UUID, limit: int = 200, offset: int = 
             parent_chunk_id=r.parent_chunk_id,
             text=r.text,
             token_count=r.token_count,
+            chunk_size_tokens=r.chunk_size_tokens,
+            overlap_tokens=r.overlap_tokens,
             strategy=r.strategy,
             extra=r.extra,
             keywords=r.keywords,
+            qdrant_point_id=r.qdrant_point_id,
+            embedding_model=r.embedding_model,
         )
         for r in rows
     ]
 
 
 @router.get("/documents/{document_id}/versions", response_model=DocumentVersionsResponse)
-def get_document_versions(document_id: uuid.UUID, db: Session = Depends(get_db)):
-    anchor = db.get(Document, document_id)
+def get_document_versions(
+    document_id: uuid.UUID, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.VIEW_DOCUMENTS)),
+):
+    anchor = db.get(DocumentModel, document_id)
     if anchor is None:
-        raise AppError(404, "document_not_found", f"Document {document_id} not found")
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
+    # Previously had no visibility check at all, unlike every sibling GET
+    # route above — a role outside this document's department could see its
+    # full version lineage. Now consistent with get_document/get_document_text.
+    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
+    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     rows = (
-        db.query(Document)
-        .filter(Document.lineage_id == anchor.lineage_id)
-        .order_by(Document.version_number)
+        db.query(DocumentModel)
+        .filter(DocumentModel.lineage_id == anchor.lineage_id)
+        .order_by(DocumentModel.version_number)
         .all()
     )
     return DocumentVersionsResponse(
@@ -476,9 +736,17 @@ def get_document_versions(document_id: uuid.UUID, db: Session = Depends(get_db))
 
 
 @router.get("/documents/{document_id}/entities", response_model=list[EntityResponse])
-def get_document_entities(document_id: uuid.UUID, db: Session = Depends(get_db)):
-    if db.get(Document, document_id) is None:
-        raise AppError(404, "document_not_found", f"Document {document_id} not found")
+def get_document_entities(
+    document_id: uuid.UUID, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.VIEW_DOCUMENTS)),
+):
+    if db.get(DocumentModel, document_id) is None:
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
+    # Same gap as /versions above — add the visibility check every sibling
+    # GET route already has.
+    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
+    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     rows = (
         db.query(EntityModel)
         .filter(EntityModel.document_id == document_id)
@@ -492,9 +760,16 @@ def get_document_entities(document_id: uuid.UUID, db: Session = Depends(get_db))
 
 
 @router.post("/documents/{document_id}/permissions", response_model=PermissionResponse, status_code=201)
-def grant_permission(document_id: uuid.UUID, body: PermissionGrantRequest, db: Session = Depends(get_db)):
-    if db.get(Document, document_id) is None:
-        raise AppError(404, "document_not_found", f"Document {document_id} not found")
+def grant_permission(
+    document_id: uuid.UUID, body: PermissionGrantRequest, db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.MANAGE_DOCUMENTS)),
+):
+    # Previously had no auth beyond get_current_user — any authenticated
+    # user could grant/list/revoke document permissions for anyone, on any
+    # document. Granting access is itself a privileged action.
+    if db.get(DocumentModel, document_id) is None:
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     if db.get(UserModel, body.user_id) is None:
         raise AppError(404, "user_not_found", f"User {body.user_id} not found")
 
@@ -507,7 +782,10 @@ def grant_permission(document_id: uuid.UUID, body: PermissionGrantRequest, db: S
         existing.permission_level = body.permission_level
         row = existing
     else:
-        row = PermissionModel(document_id=document_id, user_id=body.user_id, permission_level=body.permission_level)
+        row = PermissionModel(
+            document_id=document_id, user_id=body.user_id, permission_level=body.permission_level,
+            granted_by=current_user.id,
+        )
         db.add(row)
     db.commit()
     db.refresh(row)
@@ -518,9 +796,12 @@ def grant_permission(document_id: uuid.UUID, body: PermissionGrantRequest, db: S
 
 
 @router.get("/documents/{document_id}/permissions", response_model=list[PermissionResponse])
-def list_permissions(document_id: uuid.UUID, db: Session = Depends(get_db)):
-    if db.get(Document, document_id) is None:
-        raise AppError(404, "document_not_found", f"Document {document_id} not found")
+def list_permissions(
+    document_id: uuid.UUID, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.MANAGE_DOCUMENTS)),
+):
+    if db.get(DocumentModel, document_id) is None:
+        raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     rows = db.query(PermissionModel).filter(PermissionModel.document_id == document_id).all()
     return [
         PermissionResponse(
@@ -532,7 +813,11 @@ def list_permissions(document_id: uuid.UUID, db: Session = Depends(get_db)):
 
 
 @router.delete("/documents/{document_id}/permissions/{user_id}", status_code=204)
-def revoke_permission(document_id: uuid.UUID, user_id: uuid.UUID, db: Session = Depends(get_db)):
+def revoke_permission(
+    document_id: uuid.UUID, user_id: uuid.UUID, db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+    _permission: UserModel = Depends(require_permission(Permission.MANAGE_DOCUMENTS)),
+):
     row = (
         db.query(PermissionModel)
         .filter(PermissionModel.document_id == document_id, PermissionModel.user_id == user_id)
