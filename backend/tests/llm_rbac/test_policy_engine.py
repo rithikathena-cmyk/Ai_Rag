@@ -20,8 +20,14 @@ def _clear_caches():
     policy_loader.role_config.cache_clear()
 
 
-def _fake_user(role: str, department: str | None = None) -> SimpleNamespace:
-    return SimpleNamespace(id=uuid.uuid4(), role=role, department=department, is_active=True)
+def _fake_user(
+    role: str, department: str | None = None,
+    daily_token_limit_override: int | None = None, monthly_token_limit_override: int | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(), role=role, department=department, is_active=True,
+        daily_token_limit_override=daily_token_limit_override, monthly_token_limit_override=monthly_token_limit_override,
+    )
 
 
 def _noop_budget(*a, **k) -> None:
@@ -129,12 +135,17 @@ def test_employee_granted_permissions_is_chat_only():
 
 
 def test_hr_and_project_manager_get_document_and_analytics_but_not_admin_permissions():
-    for role in ("hr", "project_manager"):
+    _BASE = frozenset({
+        "CHAT", "VIEW_CONVERSATIONS", "VIEW_DOCUMENTS", "UPLOAD_DOCUMENTS", "DELETE_DOCUMENTS",
+        "MANAGE_DOCUMENTS", "VIEW_ANALYTICS", "VIEW_USERS",
+    })
+    # HR additionally gets MANAGE_EMPLOYEE_PII (docs/GUARDRAILS_ARCHITECTURE.md
+    # §14 — HR decides employee-PII approval requests scoped to their own
+    # department); Project Manager does not.
+    expected = {"hr": _BASE | {"MANAGE_EMPLOYEE_PII"}, "project_manager": _BASE}
+    for role, expected_permissions in expected.items():
         cfg = policy_loader.role_config(role)
-        assert cfg.granted_permissions == frozenset({
-            "CHAT", "VIEW_CONVERSATIONS", "VIEW_DOCUMENTS", "UPLOAD_DOCUMENTS", "DELETE_DOCUMENTS",
-            "MANAGE_DOCUMENTS", "VIEW_ANALYTICS", "VIEW_USERS",
-        })
+        assert cfg.granted_permissions == expected_permissions
         # None of the admin-only permissions leak in for either role.
         assert not cfg.granted_permissions & {"MANAGE_USERS", "VIEW_ROLES", "MANAGE_ROLES", "VIEW_AUDIT_LOGS", "SYSTEM_SETTINGS"}
 
@@ -158,6 +169,9 @@ def test_ceo_granted_permissions_excludes_manage_users_manage_roles_and_settings
     assert cfg.granted_permissions == frozenset({
         "CHAT", "VIEW_CONVERSATIONS", "VIEW_DOCUMENTS", "UPLOAD_DOCUMENTS", "DELETE_DOCUMENTS",
         "MANAGE_DOCUMENTS", "VIEW_ANALYTICS", "VIEW_USERS", "VIEW_ROLES", "VIEW_AUDIT_LOGS",
+        # CEO decides employee-PII approval requests unscoped — see
+        # docs/GUARDRAILS_ARCHITECTURE.md §14.
+        "MANAGE_EMPLOYEE_PII",
     })
     assert "MANAGE_USERS" not in cfg.granted_permissions
     assert "MANAGE_ROLES" not in cfg.granted_permissions

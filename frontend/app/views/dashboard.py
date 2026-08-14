@@ -4,6 +4,7 @@ from streamlit_extras.add_vertical_space import add_vertical_space
 import api_client
 from api_client import APIError
 from components import card, metric_cards, page_header, render_capabilities, role_label, show_api_error, status_badge
+from permissions import MANAGE_EMPLOYEE_PII, has_permission
 
 if not st.session_state.get("current_user"):
     st.warning("Log in to view your dashboard — see the Login page.")
@@ -148,6 +149,69 @@ if not _is_employee:
                 with card(f"dash_report_{report['id']}"):
                     st.markdown(f"**{report['title']}** ({report['format']}, {report['row_count']} rows)")
                     st.caption(report["created_at"])
+
+# Pending approvals — the fallback discovery surface now that the dedicated
+# Approvals page is gone (views/chat.py's in-chat dialog is the convenient
+# immediate-action path for the requester's own just-created employee_pii
+# request, but any authorized reviewer — not just whoever triggered it —
+# still needs a way to find and decide a request later; without this
+# section, dismissing the chat dialog would leave that request unreachable).
+# Same visibility rule main.py used for the old page's nav entry:
+# MANAGE_EMPLOYEE_PII is granted to hr/ceo/admin (llm_rbac.yaml), matching
+# GET/POST /approvals' own require_role(ADMIN, CEO, HR) — HR's results are
+# already scoped server-side to their own department, same as before.
+if has_permission(caps_result, MANAGE_EMPLOYEE_PII):
+    st.divider()
+    st.markdown("##### Pending approvals")
+    pending_result, pending_err = _safe(api_client.list_approvals, status="pending", limit=20)
+    if pending_err:
+        show_api_error(pending_err)
+    elif not pending_result["items"]:
+        st.caption("Nothing pending.")
+    else:
+        for item in pending_result["items"]:
+            try:
+                detail = api_client.get_approval(item["id"])
+            except APIError as exc:
+                with card(f"dash_approval_{item['id']}"):
+                    st.caption(f"Request {item['id']} — could not load details: {exc.message}")
+                continue
+            payload = detail.get("payload") or {}
+            with card(f"dash_approval_{item['id']}"):
+                header = f"{detail['action']} · {detail['target_type']}"
+                if payload.get("employee_id"):
+                    header += f" · {payload['employee_id']}"
+                st.markdown(f"**{header}**")
+                requester = detail.get("requested_by_email") or f"role `{detail['role']}`"
+                st.caption(f"Requested by {requester} · {detail['created_at']}")
+                if payload.get("raw_message"):
+                    st.caption(f"“{payload['raw_message']}”")
+                # employee_pii add/modify/store needs an explicit confirmed
+                # value before approving — same rule as the chat dialog and
+                # the original Approvals page: approving with an empty
+                # values dict would flip status to "active" without ever
+                # writing anything, silently no-op'ing the actual change.
+                dash_values: dict[str, str] = {}
+                if detail["target_type"] == "employee_pii" and detail["action"] in ("add", "modify", "store"):
+                    for field in ("full_name", "email", "phone", "address", "government_id"):
+                        entered = st.text_input(
+                            field.replace("_", " ").title(), key=f"dash_val_{item['id']}_{field}",
+                        )
+                        if entered:
+                            dash_values[field] = entered
+                approve_col, reject_col = st.columns(2)
+                if approve_col.button("Approve", key=f"dash_approve_{item['id']}", use_container_width=True, type="primary"):
+                    try:
+                        api_client.decide_approval(item["id"], "approved", values=dash_values or None)
+                        st.rerun()
+                    except APIError as exc:
+                        show_api_error(exc)
+                if reject_col.button("Reject", key=f"dash_reject_{item['id']}", use_container_width=True):
+                    try:
+                        api_client.decide_approval(item["id"], "rejected")
+                        st.rerun()
+                    except APIError as exc:
+                        show_api_error(exc)
 
 if _user["role"] == "admin":
     st.divider()

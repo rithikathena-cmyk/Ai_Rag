@@ -76,7 +76,16 @@ def authorize_llm_request(
     # with no duplicated quota-interpretation logic outside this module.
     rate_limiter.check_rate_limit(user.id, role_cfg.quotas.get("requests_per_minute"))
 
-    quotas.check_budget(db, user.id, role_cfg.quotas)
+    # A per-user daily/monthly token override (set by Admin/CEO via
+    # PUT /users/{id}/token-limit, see routers/users.py) takes precedence
+    # over the role default when present — everything else in role_cfg.quotas
+    # (requests, cost, rate limit) stays role-level only.
+    effective_quotas = quotas.effective_quotas(
+        role_cfg.quotas,
+        daily_token_limit_override=user.daily_token_limit_override,
+        monthly_token_limit_override=user.monthly_token_limit_override,
+    )
+    quotas.check_budget(db, user.id, effective_quotas)
 
     return PolicyDecision(
         allowed=True,

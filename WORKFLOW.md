@@ -58,8 +58,10 @@ No LLM call happens anywhere in ingestion — deterministic, same input always p
 flowchart TD
     U["User message"] --> RBAC{{"authorize_llm_request()\nrole → model tier, allowed tools,\nSQL tables, KB departments, quotas"}}
     RBAC -- "denied / over quota" --> DENY["403 / 429"]
-    RBAC -- "authorized" --> GIN{{"Input guardrails\nlength → injection → destructive → scope → PII redact"}}
-    GIN -- "blocked" --> REF["Canned refusal\nno LLM call, no retrieval"]
+    RBAC -- "authorized" --> ESC{{"Escalation gate\ntoo many recent guardrail blocks?"}}
+    ESC -- "locked out" --> LOCK["429 cooldown"]
+    ESC -- "ok" --> GIN{{"Input guardrails\nlength → injection → destructive → scope (regex)\n→ semantic risk → deberta → scope-semantic → toxicity\n→ presidio → gliner (model) → PII redact"}}
+    GIN -- "blocked" --> REF["Canned refusal\nno LLM call, no retrieval\n(counts toward escalation)"]
     GIN -- "passed" --> P{{"Planner agent\nClaude via ClaudeGateway · LangGraph loop"}}
     P -- "search_documents" --> T1["Retrieval tool"]
     P -- "query_analytics" --> T2["SQL tool"]
@@ -79,9 +81,10 @@ flowchart TD
     RP1 --> RP2["Write CSV / XLSX / DOCX / PDF"]
     RP2 -. "tool result" .-> P
 
-    ANS --> GOUT{{"Output guardrails\nprompt-leak check → PII redact"}}
+    ANS --> GOUT{{"Output guardrails\nprompt-leak+secrets check → toxicity\n→ presidio → gliner → PII redact"}}
     FB --> GOUT
-    GOUT --> CIT["Citation check + confidence score"]
+    GOUT -. "blocked" .-> LOCK2["counts toward escalation"]
+    GOUT --> CIT["Citation check + confidence score\n+ groundedness check (flag-only)"]
     CIT --> MEM["Update memory\nsummarize after 12 turns"]
 ```
 
@@ -95,15 +98,23 @@ flowchart TD
    from, and enforces per-role rate/quota limits (requests-per-minute, daily/monthly token & cost
    budgets, max concurrent requests). A denial or over-quota call short-circuits before any LLM
    or retrieval work happens.
-2. **Input guardrails** (`guardrails/pipeline.py`, each check individually toggleable) — length
-   limit → prompt-injection → destructive-intent → scope keywords → PII redaction. A block
-   short-circuits with a canned refusal; the turn is still logged.
-3. **Planner loop** (`agents/planner.py`, LangGraph `StateGraph`) — gets a role-tier-bound,
+2. **Escalation gate** (`guardrails/escalation.py::check_escalation()`, runs right after the RBAC
+   gate, before conversation lookup or any guardrail check) — a user who has accumulated enough
+   guardrail blocks (input or output, any check) within a rolling window is locked out for a
+   cooldown period. Distinct from RBAC's request-volume rate limiting: this tracks *block*
+   frequency, not request count.
+3. **Input guardrails** (`guardrails/pipeline.py`, each check individually toggleable, cheap
+   regex/keyword checks first so a block never pays for model inference) — length limit →
+   prompt-injection → destructive-intent → scope keywords (regex) → semantic risk (embedding) →
+   DeBERTa injection classifier → scope via embedding similarity → toxicity classifier → Presidio
+   PII → GLiNER PII (model-based) → PII redaction. A block short-circuits with a canned refusal;
+   the turn is still logged and counts toward the escalation gate above.
+4. **Planner loop** (`agents/planner.py`, LangGraph `StateGraph`) — gets a role-tier-bound,
    tool-bound Claude model from `gateway/claude_gateway.py::get_langchain_model()` and loops
    `agent ↔ tools` until it stops requesting tools or hits the iteration cap (4 tool calls,
    recursion limit 9). Every tool result is fed back to the same model, which re-decides whether
    to call another tool or answer.
-4. **Tools available to the planner** (each individually gatable by LLM RBAC):
+5. **Tools available to the planner** (each individually gatable by LLM RBAC):
    - `search_documents` → deterministic hybrid retrieval: metadata filter → embed query (BGE-M3)
      → dense+BM25 search with Qdrant-native RRF fusion → permission/department filter → rerank
      (`bge-reranker-base`) → numbered citations. No LLM involved — this is the actual "RAG" step.
@@ -112,15 +123,19 @@ flowchart TD
      blocklisted) → wrapped in `LIMIT 500`.
    - `generate_report` → Claude assembles content → written to CSV/XLSX/DOCX/PDF via
      `openpyxl`/`python-docx`/`reportlab`.
-5. **Fallback** — if the gateway call raises `GenerationError` (model/provider failure), the
+6. **Fallback** — if the gateway call raises `GenerationError` (model/provider failure), the
    router falls back to `run_retrieval_fallback()` — a raw, non-LLM search response — rather than
    failing the request outright.
-6. **Output guardrails** — system-prompt-leak check → PII redaction (redaction rewrites in place,
-   never blocks).
-7. **Citation check + confidence score** (`guardrails/citation_rail.py`) — flags whether the
-   answer actually carries citations and computes a relevance-based confidence level returned to
-   the frontend; this runs alongside output guardrails, not inside the same pipeline call.
-8. **Memory update** — last 6 turns kept verbatim; once a conversation passes 12 turns, older
+7. **Output guardrails** — system-prompt-leak check (now also a generic secrets scan: GitHub/
+   Slack/Google/Stripe token shapes, PEM key blocks) → toxicity classifier → Presidio PII → GLiNER
+   PII → PII redaction (redaction rewrites in place, never blocks). A block counts toward the
+   escalation gate, same as an input block.
+8. **Citation + groundedness + confidence score** (`guardrails/citation_rail.py`,
+   `guardrails/groundedness_check.py`) — citation check flags whether the answer actually carries
+   citations; groundedness runs an NLI model to flag whether the reply contradicts its retrieved
+   sources; confidence score is relevance-based. All three run alongside output guardrails, not
+   inside the same pipeline call, and none of them block — they're trace/UI signals only.
+9. **Memory update** — last 6 turns kept verbatim; once a conversation passes 12 turns, older
    turns are folded into a running LLM-generated summary.
 
 Every guardrail/RBAC/citation step is recorded as a `GuardrailStep` (allow/redact/block + detail)

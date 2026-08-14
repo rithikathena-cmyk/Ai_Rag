@@ -14,7 +14,7 @@ from app.services.auth.dependencies import get_current_user
 from app.services.auth.password import hash_password
 from app.services.auth.rbac import require_permission, require_role
 from app.services.llm_rbac.policy_loader import departments as llm_rbac_departments, role_config
-from app.services.llm_rbac.quotas import get_usage
+from app.services.llm_rbac.quotas import effective_quotas, get_usage, reset_usage
 from app.services.memory.preferences import get_preferences, update_preferences
 
 router = APIRouter()
@@ -73,12 +73,18 @@ class UserResponse(BaseModel):
     role: str
     department: str | None
     created_at: datetime
+    # None means "use the role default" from llm_rbac.yaml — see
+    # PUT /users/{user_id}/token-limit below.
+    daily_token_limit_override: int | None = None
+    monthly_token_limit_override: int | None = None
 
 
 def _to_response(row: UserModel) -> UserResponse:
     return UserResponse(
         id=row.id, email=row.email, display_name=row.display_name,
         is_active=row.is_active, role=row.role, department=row.department, created_at=row.created_at,
+        daily_token_limit_override=row.daily_token_limit_override,
+        monthly_token_limit_override=row.monthly_token_limit_override,
     )
 
 
@@ -125,6 +131,35 @@ def get_user(
     return _to_response(row)
 
 
+class TokenLimitUpdateRequest(BaseModel):
+    # PUT semantics: the body is the complete desired override state, not a
+    # partial patch — omitting a field (or sending null) means "no override,
+    # use the role default" for that field, not "leave it unchanged". This
+    # lets an Admin/CEO clear a previously-set override by re-PUTting
+    # without it, same as removing a cap they added earlier.
+    daily_tokens: int | None = Field(default=None, ge=1)
+    monthly_tokens: int | None = Field(default=None, ge=1)
+
+
+@router.put("/users/{user_id}/token-limit", response_model=UserResponse)
+def set_user_token_limit(
+    user_id: uuid.UUID, body: TokenLimitUpdateRequest, db: Session = Depends(get_db),
+    _actor: UserModel = Depends(require_role(Role.ADMIN, Role.CEO)),
+):
+    # require_role(ADMIN, CEO), not require_permission(MANAGE_USERS): same
+    # reasoning as create_user above — MANAGE_USERS is Admin-only in
+    # llm_rbac.yaml, but capping an individual user's token budget is
+    # deliberately a broader Admin+CEO grant, not role/active-status editing.
+    row = db.get(UserModel, user_id)
+    if row is None:
+        raise AppError(404, "user_not_found", f"User {user_id} not found")
+    row.daily_token_limit_override = body.daily_tokens
+    row.monthly_token_limit_override = body.monthly_tokens
+    db.commit()
+    db.refresh(row)
+    return _to_response(row)
+
+
 class UsageResponse(BaseModel):
     role: str
     # requests_per_minute/max_concurrent_requests are config-only limit
@@ -143,12 +178,15 @@ class UsageResponse(BaseModel):
     max_concurrent_requests_limit: int | None
 
 
-@router.get("/users/me/usage", response_model=UsageResponse)
-def get_my_usage(db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
-    quotas = role_config(current_user.role).quotas
-    usage = get_usage(db, current_user.id)
+def _usage_response(db: Session, user: UserModel) -> UsageResponse:
+    quotas = effective_quotas(
+        role_config(user.role).quotas,
+        daily_token_limit_override=user.daily_token_limit_override,
+        monthly_token_limit_override=user.monthly_token_limit_override,
+    )
+    usage = get_usage(db, user.id)
     return UsageResponse(
-        role=current_user.role,
+        role=user.role,
         daily_requests_limit=quotas.get("daily_requests"),
         daily_requests_used=usage["daily_requests_used"],
         daily_tokens_limit=quotas.get("daily_tokens"),
@@ -160,6 +198,44 @@ def get_my_usage(db: Session = Depends(get_db), current_user: UserModel = Depend
         requests_per_minute_limit=quotas.get("requests_per_minute"),
         max_concurrent_requests_limit=quotas.get("max_concurrent_requests"),
     )
+
+
+@router.get("/users/me/usage", response_model=UsageResponse)
+def get_my_usage(db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
+    return _usage_response(db, current_user)
+
+
+@router.get("/users/{user_id}/usage", response_model=UsageResponse)
+def get_user_usage(
+    user_id: uuid.UUID, db: Session = Depends(get_db),
+    _actor: UserModel = Depends(require_role(Role.ADMIN, Role.CEO)),
+):
+    # Same Admin+CEO grant as the token-limit/usage-reset endpoints below —
+    # lets the token-limit editor UI show a target user's current usage
+    # before an admin decides whether a limit change or a reset is what's
+    # actually needed.
+    row = db.get(UserModel, user_id)
+    if row is None:
+        raise AppError(404, "user_not_found", f"User {user_id} not found")
+    return _usage_response(db, row)
+
+
+@router.post("/users/{user_id}/usage/reset", response_model=UsageResponse)
+def reset_user_usage(
+    user_id: uuid.UUID, db: Session = Depends(get_db),
+    _actor: UserModel = Depends(require_role(Role.ADMIN, Role.CEO)),
+):
+    # Same Admin+CEO grant as PUT /users/{id}/token-limit, but a deliberately
+    # separate action from it — see reset_usage()'s docstring for why a
+    # limit change never resets usage on its own. This is the explicit "give
+    # this user a clean slate" button for when an admin actually wants that.
+    row = db.get(UserModel, user_id)
+    if row is None:
+        raise AppError(404, "user_not_found", f"User {user_id} not found")
+    reset_usage(db, user_id)
+    db.commit()
+    db.refresh(row)
+    return _usage_response(db, row)
 
 
 class CapabilitiesResponse(BaseModel):

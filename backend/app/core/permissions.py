@@ -27,6 +27,11 @@ class Permission(StrEnum):
     MANAGE_ROLES = "MANAGE_ROLES"
     VIEW_AUDIT_LOGS = "VIEW_AUDIT_LOGS"
     SYSTEM_SETTINGS = "SYSTEM_SETTINGS"
+    # Gates whether a role can even *create* an employee-PII approval request
+    # at all (routers/chat.py's pre-flight branch) — a role without this
+    # permission never reaches the new capability, and sees today's ordinary
+    # input-PII block instead. See docs/GUARDRAILS_ARCHITECTURE.md §14.
+    MANAGE_EMPLOYEE_PII = "MANAGE_EMPLOYEE_PII"
 
 
 PERMISSION_VALUES: tuple[str, ...] = tuple(p.value for p in Permission)

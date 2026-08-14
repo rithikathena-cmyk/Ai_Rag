@@ -19,6 +19,30 @@ def test_uncited_reply_with_sources_is_flagged_but_never_blocked():
     assert "no citation" in step.detail.lower()
 
 
+def test_fabricated_citation_number_is_flagged_but_never_blocked():
+    step = check_citations("The machine failed due to overheating [7].", [{"score": 0.9}, {"score": 0.8}])
+    assert step.action == "pass"  # flagged, not blocked — a model-generated citation is never auto-trusted
+    assert "fabricated" in step.detail.lower()
+    assert "7" in step.detail
+
+
+def test_valid_citation_number_within_range_is_not_flagged():
+    step = check_citations("The machine failed due to overheating [2].", [{"score": 0.9}, {"score": 0.8}])
+    assert step.action == "pass"
+    assert "fabricated" not in step.detail.lower()
+
+
+def test_citation_number_zero_is_flagged_as_fabricated():
+    step = check_citations("See source [0].", [{"score": 0.9}])
+    assert "fabricated" in step.detail.lower()
+
+
+def test_mixed_valid_and_fabricated_citations_flags_only_the_fabricated_ones():
+    step = check_citations("Per [1] and [9], the machine failed.", [{"score": 0.9}])
+    assert "9" in step.detail
+    assert step.action == "pass"
+
+
 def test_confidence_high_for_strong_relevance_scores():
     assert confidence_score([{"score": 0.9}, {"score": 0.8}]) == "high"
 

@@ -29,34 +29,105 @@ output_citation_rail:
   # score derived from the reranked sources' scores.
   citation_check_enabled: true
 
-# LLM-based advanced input check (docs/GUARDRAILS_ARCHITECTURE.md §10) — a
-# second-pass rail for phrasing the deterministic regex/keyword checks above
-# can miss (paraphrased/obfuscated injection or destructive-intent attempts).
-# Off by default, same posture as Phase 3A/3B: experimental, opt-in. Only
-# ever reached if none of the deterministic input checks already blocked —
-# positioned last in the pipeline specifically so a message that regex
-# already caught never pays for this call at all.
-llm_advanced_check:
+# Presidio-based advanced PII check (services/guardrails/presidio_check.py)
+# — a second-pass PII rail. Runs LAST among input checks (a message any
+# deterministic check above already blocked never pays for this call) AND
+# again on the way out, in run_output_guardrails() — a reply Claude
+# generated can carry the same identifier types this check targets on
+# input. Replaced the former LLM-judge llm_advanced_check (an injection/
+# jailbreak catch-all — deleted llm_check.py): Presidio has NO
+# injection/jailbreak detection capability at all, only PII/entity
+# recognition, so this slot's job is narrower now — see
+# presidio_check.py's module docstring for the full rationale and the
+# empirically-calibrated entity allowlist (Presidio's default
+# DATE_TIME/ORGANIZATION/PERSON recognizers false-positive heavily on this
+# app's own domain vocabulary, e.g. "Q2 2026"/"OEE"/"PTO"/a candidate's name
+# in an ordinary HR query, so only structurally precise identifier types are
+# blocked on — and EMAIL_ADDRESS/US_SSN/CREDIT_CARD/IP_ADDRESS are excluded
+# even though Presidio detects those cleanly, since pii.py already owns
+# those exact types and guardrail_pii_block_input is the one flag that
+# governs their block-vs-redact policy; this check only covers identifier
+# types pii.py has no recognizer for at all — passport/bank account/IBAN/
+# crypto/medical license). Local/deterministic (spaCy NER, no network call,
+# no API cost) — unlike the check it replaced, there's no rate limit or
+# provider choice to configure here.
+presidio_check:
   enabled: true
-  # anthropic: routed through the existing Claude Gateway (retries, prompt
-  # caching, usage tracking, the process-wide concurrency cap all apply for
-  # free) — real Anthropic token cost per message this check runs on. Switch
-  # back to `gemini` (a $0 free-tier quota, fully separate from the gateway)
-  # if GEMINI_API_KEY is configured again — see services/guardrails/llm_check.py.
-  provider: anthropic
-  # A ModelTier name for the anthropic provider (haiku = cheapest, since this
-  # check runs on every message that reaches it) — or a literal Gemini model
-  # string if provider: gemini (gemini-flash-latest is the free-tier alias
-  # that actually has quota as of this writing; 2.0/2.5-flash-lite 404).
-  model: haiku
-  timeout_seconds: 4.0 # only consulted by the gemini provider — the anthropic provider uses the gateway's own request_timeout_seconds (llm.yaml)
+  score_threshold: 0.7
   max_input_chars: 2000 # matches the zero-shot classifier's truncation convention
-  # Shared (not per-user) cap on calls/minute — protects Gemini's free-tier
-  # RPM quota on that provider, and caps overall cost exposure on the
-  # anthropic provider, since this check runs per message. Exceeding it
-  # fails open (see services/guardrails/llm_check.py) before the call is
-  # made. null/0 disables limiting.
-  rate_limit_per_minute: 12
+  # Omit (or leave empty) to use presidio_check.py's own _ALLOWED_ENTITIES
+  # default — only override this if you've re-validated a wider/narrower
+  # entity set against real traffic first, per that module's calibration
+  # notes.
+  entities: []
+  # If the analyzer itself fails (model not loaded, unexpected exception),
+  # block rather than silently pass — a classifier failure means "unknown
+  # whether this text is safe," not "safe." Set to false to restore the
+  # original fail-open behavior (relying on the deterministic checks on
+  # either side of this one as the security floor instead).
+  fail_closed: true
+
+# DeBERTa-based prompt-injection classifier
+# (services/guardrails/deberta_injection_check.py) — a third injection-
+# detection layer, input-only, complementing injection.py's regex and
+# semantic_check.py's embedding similarity with a model actually trained for
+# this binary classification task. Local (HuggingFace transformers, no API
+# key, no network call at inference time beyond a one-time model download).
+deberta_injection_check:
+  enabled: true
+  model_name: protectai/deberta-v3-base-prompt-injection-v2
+  # Scores observed in calibration cluster near 0/1 (>0.999 for both clearly
+  # safe and clearly unsafe messages) rather than a smooth gradient, so 0.9
+  # has generous margin either way — this is not a finely-tuned threshold,
+  # just a sane default given that score distribution.
+  score_threshold: 0.9
+  max_input_chars: 2000
+  # Unlike presidio_check/gliner_check (PII-specific, fail closed by
+  # default), this fails OPEN by default — injection.py's deterministic
+  # patterns remain the actual security floor for this coverage regardless
+  # of whether this additive model layer is reachable. See
+  # deberta_injection_check.py's check_with_deberta() docstring.
+  fail_closed: false
+
+# GLiNER-based semantic PII check (services/guardrails/gliner_check.py) — a
+# second semantic PII layer, runs on BOTH input and output, complementing
+# presidio_check's narrow structurally-precise-identifier allowlist with a
+# curated, natural-language label set for PII shapes regex/Presidio don't
+# already cover. Local (the `gliner` package, no API key, no network call at
+# inference time beyond a one-time model download). Deliberately excludes
+# person-name/organization-style labels — see gliner_check.py's module
+# docstring for why (this app's HR/manufacturing content routinely and
+# legitimately names real employees; a name-catching label would make
+# ordinary queries unusable, the same false-positive lesson presidio_check's
+# own allowlist already learned for Presidio's default PERSON recognizer).
+gliner_check:
+  # Disabled: its "government-issued identification number" label
+  # false-triggers on this app's own internal employee-ID format
+  # (STF-MFG-41220 scored 0.62-0.77, above the 0.6 threshold, in
+  # sentences naming an incident reporter — a real, live false positive,
+  # not theoretical: it blocked "Who reported the Line 7 stoppage
+  # incident, and what is their contact information?" outright instead
+  # of just redacting). Re-wording the label was tried (5 variants
+  # measured directly against real SSN/passport examples plus the
+  # employee-ID false positive) — every variant that fixed the false
+  # positive also dropped real SSN and/or passport detection below
+  # threshold, with presidio_check unable to backstop passport numbers
+  # either (scores ~0.4, below its own 0.7 threshold, on the same test
+  # string). No wording found that fixed the false positive without a
+  # worse regression elsewhere, so disabling was the explicit call
+  # (user-requested) rather than shipping a still-broken label.
+  # presidio_check + pii_redact remain as this pipeline's PII coverage.
+  enabled: false
+  model_name: urchade/gliner_small-v2.1
+  # Omit (or leave empty) to use gliner_check.py's own _DEFAULT_LABELS —
+  # only override this if you've re-validated a wider/narrower label set
+  # against real traffic first, per that module's calibration notes.
+  labels: []
+  score_threshold: 0.6
+  max_input_chars: 2000
+  # Same reasoning as presidio_check.fail_closed above — a PII-specific
+  # classifier failure means "unknown," not "safe."
+  fail_closed: true
 
 # Local, non-LLM semantic input check (docs/GUARDRAILS_ARCHITECTURE.md §12) —
 # catches paraphrased/obfuscated variants of injection.py's/destructive.py's
@@ -68,3 +139,108 @@ semantic_check:
   enabled: true
   threshold: 0.80 # cosine similarity to the nearest known-unsafe example; raise to reduce false positives, lower to catch more paraphrases
   max_input_chars: 2000
+
+# Local toxicity/harassment classifier (services/guardrails/toxicity_check.py)
+# — unitary/toxic-bert, a multi-label HuggingFace model (toxic/severe_toxic/
+# obscene/threat/insult/identity_hate). Runs on BOTH input and output, same
+# as presidio_check/gliner_check. No API key, no network call at inference
+# time beyond a one-time model download.
+toxicity_check:
+  enabled: true
+  model_name: unitary/toxic-bert
+  score_threshold: 0.7
+  max_input_chars: 2000
+  # Same reasoning as deberta_injection_check.fail_closed: additive coverage
+  # with no existing check backing up this specific category, but an infra
+  # problem here still must not block an ordinary message by default.
+  fail_closed: false
+
+# Embedding-similarity scope check (services/guardrails/scope_semantic_check.py)
+# — complements scope.py's keyword allow/deny list with semantic similarity
+# to configured example in-scope questions. Reuses the same BGE-M3 model
+# semantic_check.py already loads. Opt-in: empty `topics` (the default)
+# makes this check a no-op, matching scope.py's own allow-list semantics —
+# populate `topics` with a handful of representative in-scope questions for
+# your deployment's domain to turn this on meaningfully.
+scope_semantic_check:
+  enabled: true
+  # Representative in-scope examples, one or two per seeded document
+  # department (backend/scripts/seed_corpus_v2.py's DOCUMENTS list) plus
+  # general platform usage — not exhaustive, just enough spread for
+  # MaxSimilarityMatcher to separate a genuine paraphrase of any of these
+  # from something unrelated (e.g. "How do I delete a row in SQL?", which
+  # sits far below threshold from all of them). Deny-list keyword catches
+  # obvious cases fast (see .env's GUARDRAIL_SCOPE_DENY_KEYWORDS); this is
+  # the complementary catch for paraphrased/unlisted off-topic questions.
+  topics:
+    - "What is the machine shutdown procedure for the production line?"
+    - "What does the quality inspection SOP require?"
+    - "What is our leave management policy?"
+    - "How does the recruitment process work?"
+    - "What is the preventive maintenance schedule for the equipment?"
+    - "How do I submit an engineering change request?"
+    - "Summarize the quarterly operations report."
+    # Incident reports are a real, RBAC-tested document category (3 of the 19
+    # seeded docs are incident reports: mfg_incident_report_line7_stoppage.md,
+    # hr_incident_report_grievance.md, eng_incident_report_hydraulic_leak.md)
+    # missing from the original topic list — found live: "Who reported the
+    # Line 7 stoppage incident, and what's their contact information?" (the
+    # exact scenario planner_agent_v5.yaml's v4 changelog documents as an
+    # authorized-PII-grounding test case) scored only 0.49, below threshold,
+    # and was wrongly blocked. Two examples added, not one, since the
+    # category spans both "what happened" and "who was involved" phrasings.
+    - "Who reported the Line 7 stoppage incident, and what is their contact information?"
+    - "What happened in the hydraulic leak incident report?"
+    - "What are the key metrics in the plant performance report?"
+    - "How do I upload a new document to the system?"
+    - "Generate a report of recent conversations."
+    # scripts/seed_corpus_v3.py's 8-document batch — measured live against
+    # this exact matcher before adding anything (not guessed): onboarding
+    # ("What is our onboarding process for new hires?", 0.735) and customer
+    # satisfaction ("What are our customer satisfaction metrics?", 0.652)
+    # already passed via proximity to the recruitment/plant-performance
+    # topics above, so nothing added for those. Four genuinely didn't:
+    # safety (0.487), code of conduct (0.494), budget (0.510), and the
+    # conveyor incident (0.548 — just under threshold, close enough to be
+    # the kind of near-miss worth confirming with a real example rather
+    # than assuming it'll round up).
+    - "What are the safety procedures for the production floor?"
+    - "What is our code of conduct policy?"
+    - "What is the annual budget summary?"
+    - "What happened in the conveyor jam incident?"
+    # Found via the RBAC department-scoping verification matrix: a PM asking
+    # about their own department's spec doc (eng_spec_conveyor_system.md,
+    # ENG-SPEC-CV350) was wrongly blocked here before RBAC ever got a chance
+    # to run — best=0.52 vs the conveyor *incident* topic above, under the
+    # 0.55 threshold, because "specs" and "incident" aren't close enough.
+    - "What are the specs of the CV-350 conveyor system?"
+  threshold: 0.55 # cosine similarity below this to EVERY configured topic blocks; lower to loosen, raise to tighten
+  max_input_chars: 2000
+
+# NLI-based groundedness/hallucination check on the reply
+# (services/guardrails/groundedness_check.py) — cross-encoder/nli-deberta-v3-base,
+# scoring whether the reply contradicts its retrieved sources. Reuses the
+# sentence-transformers CrossEncoder loading pattern already used for
+# reranking (services/reranking/model_loader.py), just a different
+# checkpoint. Deliberately NEVER blocks (see that module's docstring) — a
+# visible trace/confidence signal, not a gate, same policy as
+# output_citation_rail above.
+groundedness_check:
+  enabled: true
+  model_name: cross-encoder/nli-deberta-v3-base
+  contradiction_threshold: 0.5
+  max_premise_chars: 4000
+  max_reply_chars: 2000
+  fail_closed: false
+
+# Repeated-block escalation (services/guardrails/escalation.py) — locks a
+# user out for a cooldown period after they accumulate enough guardrail
+# blocks (input OR output) within a rolling window. Distinct from
+# llm_rbac.yaml's per-role request-rate limiting: this tracks BLOCK
+# frequency, not request volume. In-process only (see that module's
+# docstring for the multi-worker caveat).
+escalation:
+  enabled: true
+  block_threshold: 5 # this many blocks...
+  window_seconds: 600 # ...within this rolling window...
+  lockout_seconds: 300 # ...triggers a lockout of this length

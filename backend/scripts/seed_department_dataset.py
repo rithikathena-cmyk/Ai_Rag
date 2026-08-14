@@ -17,6 +17,10 @@ work FastAPI's TestClient handles fine, but a live server is simpler to
 reason about for a one-off seed run). Usage:
 
     python scripts/seed_department_dataset.py
+
+Reads the backend's port from this repo's own Settings (same as the app
+itself) rather than a hardcoded port that can silently drift from the real
+dev setup.
 """
 
 import sys
@@ -28,11 +32,12 @@ import httpx
 
 sys.path.insert(0, ".")
 
+from app.core.config import settings
 from app.db.postgres import new_session
 from app.models.user import UserModel
 from app.services.auth.password import hash_password
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = f"http://127.0.0.1:{settings.backend_port}"
 DATASET_DIR = Path(__file__).parent / "_seed_dataset"
 
 # (filename, department)

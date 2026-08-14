@@ -182,6 +182,11 @@ roles:
       - DELETE_DOCUMENTS
       - MANAGE_DOCUMENTS
       - VIEW_ANALYTICS
+      # HR may create/decide employee-PII approval requests (docs/
+      # GUARDRAILS_ARCHITECTURE.md §14), scoped to their own department at
+      # decide-time (routers/approvals.py) — this permission alone doesn't
+      # bypass that scope check.
+      - MANAGE_EMPLOYEE_PII
       - VIEW_USERS
     reports:
       allowed:
@@ -369,6 +374,10 @@ roles:
       - DELETE_DOCUMENTS
       - MANAGE_DOCUMENTS
       - VIEW_ANALYTICS
+      # CEO decides employee-PII approval requests unscoped (same convention
+      # as this role's existing project/document approval authority) — see
+      # docs/GUARDRAILS_ARCHITECTURE.md §14.
+      - MANAGE_EMPLOYEE_PII
       - VIEW_USERS
       - VIEW_ROLES
       - VIEW_AUDIT_LOGS
@@ -418,6 +427,9 @@ roles:
       - MANAGE_ROLES
       - VIEW_AUDIT_LOGS
       - SYSTEM_SETTINGS
+      # Admin decides employee-PII approval requests unscoped — see
+      # docs/GUARDRAILS_ARCHITECTURE.md §14.
+      - MANAGE_EMPLOYEE_PII
     # Covers both CEO's full report catalog (executive_report, project_portfolio,
     # production, maintenance, quality, inventory, warehouse, procurement, hr,
     # workforce, enterprise, risk, management_summary, ...) and Admin's own

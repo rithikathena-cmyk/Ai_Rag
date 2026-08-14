@@ -1,3 +1,5 @@
+from urllib.parse import quote
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -11,8 +13,17 @@ _schema_ready = False
 
 
 def _dsn() -> str:
+    # User/password must be percent-encoded before going into a URL — a raw
+    # "@" (or ":", "/", etc.) in either one collides with the DSN's own
+    # delimiters. The local dev default password has no such characters, so
+    # this was latent until a real managed-Postgres password (e.g.
+    # Supabase's, which can contain "@") broke it: the credentials parser
+    # split on the wrong "@" and tried to resolve part of the password as
+    # the hostname.
+    user = quote(settings.postgres_user, safe="")
+    password = quote(settings.postgres_password, safe="")
     return (
-        f"postgresql+psycopg://{settings.postgres_user}:{settings.postgres_password}"
+        f"postgresql+psycopg://{user}:{password}"
         f"@{settings.postgres_host}:{settings.postgres_port}/{settings.postgres_db}"
     )
 
@@ -66,6 +77,7 @@ def ensure_schema() -> None:
     import app.models.project  # noqa: F401  (registers ProjectModel on Base.metadata)
     import app.models.project_member  # noqa: F401  (registers ProjectMemberModel on Base.metadata)
     import app.models.approval_request  # noqa: F401  (registers ApprovalRequestModel on Base.metadata)
+    import app.models.employee_pii_record  # noqa: F401  (registers EmployeePIIRecordModel on Base.metadata)
 
     Base.metadata.create_all(bind=get_engine())
     _run_light_migrations()
@@ -144,6 +156,12 @@ def _run_light_migrations() -> None:
         # at original insert time (the old combined role's display name) —
         # relabel to match ceo's new standalone display_name in llm_rbac.yaml.
         r"UPDATE users SET display_name = REPLACE(display_name, 'CEO/Admin', 'CEO') WHERE role = 'ceo' AND display_name LIKE 'CEO/Admin%'",
+        # Per-user token limit overrides (routers/users.py PUT
+        # /users/{id}/token-limit) — Admin/CEO can cap an individual user's
+        # daily/monthly token budget below their role's default. NULL means
+        # "use the role default", see services/llm_rbac/engine.py.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_token_limit_override INTEGER",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_token_limit_override INTEGER",
     ]
     with get_engine().begin() as conn:
         for stmt in statements:

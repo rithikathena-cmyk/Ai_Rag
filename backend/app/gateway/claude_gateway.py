@@ -143,11 +143,32 @@ class ClaudeGateway:
         # shape difference caching introduces.
         return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
 
-    def get_langchain_model(self, tier: ModelTier = ModelTier.FAST, max_tokens: int | None = None) -> ChatAnthropic:
+    def get_langchain_model(
+        self, tier: ModelTier = ModelTier.FAST, max_tokens: int | None = None, temperature: float | None = None
+    ) -> ChatAnthropic:
         """Returns a LangChain-compatible model for callers that need
         .bind_tools()/ToolNode (i.e. the LangGraph planner loop) instead of a
         single generate() call. Routed through the same model_router as
-        generate(), so tier selection stays consistent across both paths."""
+        generate(), so tier selection stays consistent across both paths.
+
+        `temperature` defaults to None (Anthropic's own ~1.0 default) so any
+        caller that doesn't pass it keeps today's behavior unchanged —
+        currently only services/agents/planner.py passes one, pinned to
+        settings.agent_temperature, since that's the only caller of this
+        method (the LangGraph planner loop).
+
+        Silently ignored (not applied) whenever `tier` uses extended
+        thinking (tier_config.supports_extended_reasoning, True by default
+        for every tier except haiku — see models.yaml): verified live
+        against claude-sonnet-5 that Anthropic's API rejects any thinking
+        request with `temperature` != 1 with a 400 invalid_request_error
+        ("`temperature` may only be set to 1 when thinking is enabled").
+        Silently dropping rather than raising keeps this call site safe to
+        pass a temperature unconditionally without the caller needing to
+        know per-tier which ones support it — the same reasoning as the
+        thinking/output_config gating two lines below, which exists for the
+        same kind of per-tier API-shape incompatibility (haiku rejecting
+        thinking itself)."""
         if not settings.anthropic_api_key:
             raise GenerationError("ANTHROPIC_API_KEY is not configured", reason=GenerationErrorReason.NO_API_KEY)
         tier_config = model_router.resolve(tier)
@@ -157,6 +178,8 @@ class ClaudeGateway:
             api_key=settings.anthropic_api_key,
             timeout=_request_timeout_seconds(),
         )
+        if temperature is not None and not tier_config.supports_extended_reasoning:
+            kwargs["temperature"] = temperature
         if tier_config.supports_extended_reasoning:
             kwargs["thinking"] = {"type": "adaptive"}
             kwargs["output_config"] = {"effort": tier_config.effort}

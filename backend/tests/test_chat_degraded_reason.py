@@ -159,7 +159,21 @@ def test_input_guardrail_block_returns_a_valid_response_not_a_500(monkeypatch):
     pydantic ValidationError instead of returning the intended block
     message. Needs guardrails actually enabled, unlike every other test in
     this file (which disables them to isolate the degraded-response logic
-    under test) — this is exactly the path those tests never exercised."""
+    under test) — this is exactly the path those tests never exercised.
+
+    deberta_injection_check/gliner_check are explicitly disabled here (real
+    models, not stubbed elsewhere in this file) so this test exercises the
+    SAME check (pii_redact) it always has — gliner_check's broader semantic
+    label set ("government identification number") would otherwise
+    correctly, but disruptively for this specific assertion, catch the SSN
+    first via a different check than the one this regression test is about."""
+    from app.services.guardrails import deberta_injection_check, gliner_check
+
+    monkeypatch.setattr(
+        deberta_injection_check, "load_yaml_config", lambda name: {"deberta_injection_check": {"enabled": False}}
+    )
+    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": {"enabled": False}})
+
     settings.guardrails_enabled = True
     try:
         client = _make_app(monkeypatch)

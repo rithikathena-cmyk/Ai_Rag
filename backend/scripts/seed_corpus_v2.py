@@ -8,8 +8,10 @@ check regardless of department; the endpoint's `department` and
 `security_classification` Form fields let one uploader tag each document
 correctly). The uploader user is deleted again at the end.
 
-Usage: python scripts/seed_corpus_v2.py   (requires the backend running on
-127.0.0.1:8000, e.g. `uvicorn app.main:app --port 8000`)
+Usage: python scripts/seed_corpus_v2.py   (requires the backend already
+running — reads its port from this repo's own Settings, same as the app
+itself, rather than a hardcoded port that silently drifts from the real dev
+setup)
 """
 
 import sys
@@ -21,11 +23,12 @@ import httpx
 
 sys.path.insert(0, ".")
 
+from app.core.config import settings
 from app.db.postgres import new_session
 from app.models.user import UserModel
 from app.services.auth.password import hash_password
 
-BASE_URL = "http://127.0.0.1:8000"
+BASE_URL = f"http://127.0.0.1:{settings.backend_port}"
 DATASET_DIR = Path(__file__).parent / "_seed_corpus_v2"
 
 # (filename, department, security_classification)

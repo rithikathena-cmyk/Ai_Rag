@@ -62,15 +62,21 @@ that were missing or inconsistent:
 
 ## 4. Approval requirements — what "required" means today
 
-`PolicyDecision.requires_approval` was already computed by `engine.py` before this pass, but nothing
-consumed it (`docs/AUDIT_LOGGING.md` §3 flagged this explicitly: "no enforcement consumes it yet").
-`routers/documents.py::delete_document()` is now the one consumer: if `decision.requires_approval` is
-true, the request is **blocked with `403 approval_required`**, not silently allowed. This is a
-deliberate choice, not a partial implementation — there is no `ApprovalRequest` model or grant
-mechanism anywhere in this repo, and building one wasn't in scope for this pass (the spec explicitly
-says not to fake capabilities that don't exist). Blocking honestly is the correct behavior until a
-real approval workflow ships; silently allowing would defeat the point of marking the action
-approval-required in the first place.
+**Superseded — kept for history, see current behavior below.** `PolicyDecision.requires_approval`
+was originally computed by `engine.py` with nothing consuming it, and this section used to describe
+`routers/documents.py::delete_document()` blocking with a bare `403 approval_required` because no
+`ApprovalRequest` model existed yet. That model now exists (`app/models/approval_request.py`) and
+`delete_document()` queues a real, decidable request instead of hard-blocking — see
+`docs/PROJECT_GOVERNANCE.md` for that build and `docs/AUDIT_LOGGING.md` §3 (also updated) for the
+current queue-and-202 behavior.
+
+A second, independent approval-gated capability now exists alongside it: the employee-PII human
+approval workflow (`docs/GUARDRAILS_ARCHITECTURE.md` §14) — `routers/chat.py` detects a request to
+read/add/modify/store an employee's PII, masks it, and queues an `ApprovalRequestModel`
+(`target_type="employee_pii"`) the same way, rather than reusing `requires_approval`/
+`approval_required_actions` at all (that mechanism is specific to the `action` capability strings
+`authorize_llm_request()` already resolves; employee-PII intent is detected independently, from the
+message itself, since it isn't a named capability a client opts into).
 
 ## 5. Extension point
 

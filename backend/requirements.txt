@@ -28,7 +28,7 @@ transformers==5.14.1
 tokenizers==0.22.2
 huggingface-hub==1.26.0
 anthropic==0.120.2
-httpx==0.28.1  # already a transitive dep of anthropic; pinned explicitly now that services/guardrails/llm_check.py calls it directly
+httpx==0.28.1  # already a transitive dep of anthropic; pinned explicitly since other modules (e.g. services/retrieval/query_rewrite.py) call it directly
 langgraph==1.2.10
 langchain-anthropic==1.5.3
 langchain-core==1.5.3
@@ -42,3 +42,21 @@ tree-sitter-c-sharp==0.23.5
 
 spacy==3.8.14
 en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+# services/guardrails/presidio_check.py — reuses the en_core_web_sm model
+# above as its NLP engine (see that module for why, and for the entity
+# allowlist calibrated against false positives on this app's own domain
+# vocabulary) rather than Presidio's usual default (en_core_web_lg), which
+# isn't installed here.
+presidio-analyzer==2.2.364
+
+# services/guardrails/gliner_check.py — a second semantic PII check
+# (zero-shot NER, curated natural-language label set), run in-process via
+# the `gliner` package directly. No conflicts observed with this project's
+# existing transformers/torch pins.
+gliner==0.2.28
+
+# services/guardrails/deberta_injection_check.py — a third, model-based
+# prompt-injection classifier (protectai/deberta-v3-base-prompt-injection-v2
+# by default), run via this project's existing transformers/torch
+# dependency — no new ML framework pin needed, just the model itself
+# (downloaded from HuggingFace Hub on first use, cached thereafter).

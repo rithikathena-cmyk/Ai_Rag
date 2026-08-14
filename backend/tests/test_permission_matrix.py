@@ -61,14 +61,20 @@ def test_conversations_routes_require_a_verified_user():
 
 
 def test_conversations_list_forces_non_privileged_callers_to_their_own_user_id():
+    # BROAD_CONVERSATION_VISIBILITY_ROLES/authorize_conversation_access live
+    # in services/memory/store.py, not as local/underscore-prefixed helpers
+    # in this router — centralized there specifically so routers/chat.py's
+    # conversation_id continuation path enforces the same ownership check
+    # (see that function's own docstring). This test previously looked for
+    # a "_BROAD_VISIBILITY_ROLES" name that was never the actual symbol.
     source = inspect.getsource(conversations.list_conversations)
-    assert "_BROAD_VISIBILITY_ROLES" in source
+    assert "BROAD_CONVERSATION_VISIBILITY_ROLES" in source
     assert "current_user.id" in source
 
 
 def test_conversations_detail_and_delete_check_ownership():
     for route in (conversations.get_conversation_detail, conversations.delete_conversation):
-        assert "_authorize_conversation_access" in inspect.getsource(route)
+        assert "authorize_conversation_access" in inspect.getsource(route)
 
 
 # ---------------------------------------------------------------- upload_logs

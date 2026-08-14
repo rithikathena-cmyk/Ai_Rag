@@ -2,9 +2,10 @@ import streamlit as st
 
 import api_client
 from api_client import APIError, get_health
-from components import conversation_row, inject_global_styles, sidebar_brand, sidebar_profile, sidebar_section_label
+from components import activity_log_panel, conversation_row, inject_global_styles, sidebar_brand, sidebar_profile
 from permissions import (
-    SYSTEM_SETTINGS, VIEW_ANALYTICS, VIEW_AUDIT_LOGS, VIEW_DOCUMENTS, VIEW_ROLES, VIEW_USERS, has_permission,
+    SYSTEM_SETTINGS, VIEW_ANALYTICS, VIEW_AUDIT_LOGS, VIEW_DOCUMENTS, VIEW_ROLES, VIEW_USERS,
+    has_permission,
 )
 
 st.set_page_config(page_title="RAG Platform", page_icon=":material/auto_awesome:", layout="wide")
@@ -95,12 +96,16 @@ if _user:
     if _role in ("admin", "ceo"):
         pages.setdefault("Administration", []).append(st.Page("views/evaluation.py", title="Evaluation", icon=":material/science:"))
 
-if st.session_state.pop("_redirect_after_login", False) and "Overview" in pages:
+if st.session_state.pop("_redirect_after_login", False) and "Assistant" in pages:
     # Pass the actual StreamlitPage object just built into `pages`, not a
     # bare path string — switch_page() needs to resolve against the exact
     # page instance registered with st.navigation() in *this* run (see
     # views/login.py for why this can't happen on the same run as login).
-    st.switch_page(pages["Overview"][0])
+    # Chat, not Dashboard — every role's actual work starts in chat, and
+    # Chat is available to every logged-in role including Employee (see
+    # this dict's own comment above), so "Assistant" is always present
+    # whenever "Overview" would have been.
+    st.switch_page(pages["Assistant"][0])
 
 # position="hidden" turns off Streamlit's own auto-rendered page list, which
 # always draws in its own fixed slot above anything a page/main.py puts in
@@ -144,42 +149,47 @@ with st.sidebar:
         if _recent_err:
             st.caption(f"Couldn't load conversations — {_recent_err.message}")
         elif _recent:
-            sidebar_section_label("Recent")
-            for c in _recent:
-                label = c["title"] or f"Conversation {c['id'][:8]}"
-                active = c["id"] == st.session_state.get("conversation_id")
-                title_clicked, delete_clicked = conversation_row(c["id"], label, active)
-                if title_clicked and not active:
-                    try:
-                        detail = api_client.get_conversation(c["id"])
-                        st.session_state.conversation_id = c["id"]
-                        st.session_state.chat_messages = [
-                            {
-                                "role": m["role"], "content": m["content"], "sources": m["sources"] or [],
-                                "report": m["report"], "trace": [], "model_tier": None, "degraded": False,
-                            }
-                            for m in detail["messages"]
-                        ]
-                        st.switch_page("views/chat.py")
-                    except APIError as exc:
-                        st.error(exc.message)
-                if delete_clicked:
-                    try:
-                        api_client.delete_conversation(c["id"])
-                        if active:
-                            st.session_state.conversation_id = None
-                            st.session_state.chat_messages = []
-                        st.rerun()
-                    except APIError as exc:
-                        st.error(exc.message)
+            # Collapsed by default — a dropdown-style disclosure instead of
+            # always rendering every conversation flatly in the sidebar,
+            # which ate a lot of vertical space once there were more than a
+            # handful. conversation_row()'s own click/delete handling is
+            # unchanged; only the collapse wrapper around the loop is new.
+            with st.expander(f"Recent ({len(_recent)})"):
+                for c in _recent:
+                    label = c["title"] or f"Conversation {c['id'][:8]}"
+                    active = c["id"] == st.session_state.get("conversation_id")
+                    title_clicked, delete_clicked = conversation_row(c["id"], label, active)
+                    if title_clicked and not active:
+                        try:
+                            detail = api_client.get_conversation(c["id"])
+                            st.session_state.conversation_id = c["id"]
+                            st.session_state.chat_messages = [
+                                {
+                                    "role": m["role"], "content": m["content"], "sources": m["sources"] or [],
+                                    "report": m["report"], "trace": [], "model_tier": None, "degraded": False,
+                                }
+                                for m in detail["messages"]
+                            ]
+                            st.switch_page("views/chat.py")
+                        except APIError as exc:
+                            st.error(exc.message)
+                    if delete_clicked:
+                        try:
+                            api_client.delete_conversation(c["id"])
+                            if active:
+                                st.session_state.conversation_id = None
+                                st.session_state.chat_messages = []
+                            st.rerun()
+                        except APIError as exc:
+                            st.error(exc.message)
 
-        # Role-aware navigation — one section label + st.page_link() per
-        # visible link, straight from the permission-driven `pages` dict
-        # built above ("Account" is the pre-login group, skipped here).
+        # Role-aware navigation — a flat st.page_link() list, straight from
+        # the permission-driven `pages` dict built above ("Account" is the
+        # pre-login group, skipped here). No section-label headers ("Overview",
+        # "Assistant", ...) between groups — just the links themselves.
         for section, section_pages in pages.items():
             if section == "Account":
                 continue
-            sidebar_section_label(section)
             for p in section_pages:
                 # st.page_link() does NOT inherit the icon from the
                 # st.Page object automatically (verified against this
@@ -206,6 +216,19 @@ with st.sidebar:
                 "Show reasoning summary", key="chat_show_reasoning",
                 help="Show the guardrail & agent steps behind each chat reply.",
             )
+
+        # Activity Log — guardrail checks + sources for every reply, live
+        # inline in the sidebar (an st.expander, not a popover — see
+        # activity_log_panel()'s own docstring for why that swap happened:
+        # a popover's body renders through a portal with no size cap, and
+        # once a session has enough turns/checks it grows tall/wide enough
+        # to cover other page content). Reachable from any page, like
+        # Settings above. Reads st.session_state.chat_messages directly
+        # rather than a fresh API call — sources/trace are already returned
+        # with every /chat response and stored there; nothing new to fetch.
+        _chat_messages = st.session_state.get("chat_messages", [])
+        _assistant_messages = [m for m in _chat_messages if m["role"] == "assistant" and m.get("trace")]
+        activity_log_panel(_assistant_messages)
 
         # Spacer pushes everything below it to the bottom of the sidebar
         # when there's room (see inject_global_styles()'s .ep-spacer rule).

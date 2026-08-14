@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, String, func
+from sqlalchemy import Boolean, DateTime, Integer, String, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -19,6 +19,12 @@ class UserModel(Base):
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="user", server_default="user")
     department: Mapped[str | None] = mapped_column(String(64), nullable=True)
     preferences: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    # Per-user overrides of the role's default token quotas (llm_rbac.yaml).
+    # NULL means "use the role default" — set by Admin/CEO via
+    # PUT /users/{id}/token-limit, see routers/users.py.
+    daily_token_limit_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    monthly_token_limit_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), onupdate=func.now(), nullable=True)

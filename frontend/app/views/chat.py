@@ -1,3 +1,5 @@
+import re
+
 import streamlit as st
 from streamlit_extras.stylable_container import stylable_container
 
@@ -8,6 +10,81 @@ from components import (
     debug_json, render_capabilities, role_label, show_api_error, sorted_model_tiers,
 )
 from permissions import UPLOAD_DOCUMENTS, has_permission
+
+_APPROVAL_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _pending_employee_pii_approval(trace: list[dict]) -> dict | None:
+    """None unless this turn's trace shows the employee-PII approval gate
+    fired (routers/chat.py's pre-flight branch, docs/GUARDRAILS_ARCHITECTURE.md
+    §14) — every other reply shape (a normal answer, an ordinary guardrail
+    block, a degraded response) returns None here, so the dialog below only
+    ever pops for this one specific outcome."""
+    intent_step = next((s for s in trace if s.get("tool") == "employee_pii_intent"), None)
+    requested_step = next((s for s in trace if s.get("tool") == "employee_pii_approval_requested"), None)
+    if intent_step is None or requested_step is None:
+        return None
+    match = _APPROVAL_ID_RE.search(requested_step.get("summary", ""))
+    if match is None:
+        return None
+    return {"approval_id": match.group(0), "detail": intent_step.get("summary", "")}
+
+
+@st.dialog("Approval required")
+def _employee_pii_approval_dialog(approval_id: str, detail: str) -> None:
+    st.markdown("🔒 **This request needs sign-off before it takes effect.**")
+    st.caption(detail)
+    st.caption("Nothing has been sent to the AI model or written anywhere yet.")
+
+    try:
+        approval = api_client.get_approval(approval_id)
+    except APIError as exc:
+        show_api_error(exc)
+        if st.button("Dismiss", use_container_width=True):
+            st.rerun()
+        return
+
+    if approval["status"] != "pending":
+        decider = approval.get("decided_by_email") or "another reviewer"
+        st.caption(f"Already **{approval['status']}** by {decider}.")
+        if st.button("Dismiss", use_container_width=True):
+            st.rerun()
+        return
+
+    payload = approval.get("payload") or {}
+    if payload.get("raw_message"):
+        st.write("**Requested change** (visible only to you as an authorized reviewer):")
+        st.code(payload["raw_message"])
+
+    # Reviewer types the value themselves — never pre-filled from the
+    # message above, matching the same explicit-confirmation guarantee
+    # views/approvals.py's original form had. A false extraction from the
+    # raw message is never trusted as the final written value.
+    values: dict[str, str] = {}
+    if approval["action"] in ("add", "modify", "store"):
+        st.caption("Type the confirmed value(s) below — read them off the requested change above.")
+        for field in ("full_name", "email", "phone", "address", "government_id"):
+            entered = st.text_input(field.replace("_", " ").title(), key=f"dialog_val_{approval_id}_{field}")
+            if entered:
+                values[field] = entered
+
+    col_approve, col_reject, col_dismiss = st.columns(3)
+    if col_approve.button("Approve", type="primary", use_container_width=True):
+        try:
+            api_client.decide_approval(approval_id, "approved", values=values or None)
+            st.success("Approved.")
+            st.rerun()
+        except APIError as exc:
+            show_api_error(exc)
+    if col_reject.button("Reject", use_container_width=True):
+        try:
+            api_client.decide_approval(approval_id, "rejected")
+            st.success("Rejected.")
+            st.rerun()
+        except APIError as exc:
+            show_api_error(exc)
+    if col_dismiss.button("Decide later", use_container_width=True):
+        st.rerun()
 
 # /chat is LLM-RBAC-governed (docs/LLM_RBAC_ARCHITECTURE.md) and requires a
 # verified identity — there is no anonymous mode anymore, since the caller's
@@ -24,41 +101,6 @@ def render_trace(trace):
         st.markdown(f"{i}. {icon} **{step['agent']} → `{step['tool']}`** — {step['summary']}")
         if step.get("input"):
             st.caption(f"input: {step['input']}")
-
-
-# routers/chat.py's _guardrail_trace() formats every GuardrailStep's summary
-# as "{action}: {detail}" (services/guardrails/types.py) — action is always
-# one of these three literal prefixes, so a plain string-prefix check is
-# exact, not a heuristic.
-_GUARDRAIL_ICONS = {"pass": "✅", "block": "🚫", "redact": "✂️"}
-
-
-def _guardrail_action(step: dict) -> str:
-    return step["summary"].split(":", 1)[0]
-
-
-def render_guardrail_checks(trace: list[dict]) -> None:
-    """Every guardrail check that ran on this turn — input AND output side —
-    with its pass/block/redact outcome, always visible (not gated behind the
-    sidebar's "show reasoning" toggle like the full agent trace below,
-    since the backend already computes and returns this on every single
-    response regardless of that setting; hiding it by default just made it
-    hard to find). routers/chat.py appends one trace entry per guardrail
-    check that actually ran, blocked or not, so a passing check is exactly
-    as visible here as a blocking one."""
-    checks = [step for step in trace if step["agent"] == "Guardrails"]
-    if not checks:
-        return
-    blocked = sum(1 for c in checks if _guardrail_action(c) != "pass")
-    label = (
-        f"🛡️ Guardrail checks — all {len(checks)} passed" if blocked == 0
-        else f"🛡️ Guardrail checks — {len(checks) - blocked} passed, {blocked} flagged"
-    )
-    with st.expander(label, expanded=False):
-        for check in checks:
-            action = _guardrail_action(check)
-            icon = _GUARDRAIL_ICONS.get(action, "•")
-            st.markdown(f"{icon} **`{check['tool']}`** — {check['summary']}")
 
 
 # "The next model" (the degraded-response retry button) walks forward
@@ -158,17 +200,27 @@ def _retry_with_tier(idx: int, tier: str) -> None:
         "report": result["report"], "trace": result["trace"],
         "model_tier": result["model_tier"], "degraded": result["degraded"],
         "degraded_reason": result.get("degraded_reason"),
+        "response_time_ms": result.get("response_time_ms"),
     }
     st.rerun()
 
 
+def _format_response_time(ms: float | None) -> str | None:
+    if ms is None:
+        return None
+    return f"{ms / 1000:.1f}s" if ms >= 1000 else f"{ms:.0f}ms"
+
+
 def render_assistant_message(idx: int, msg: dict, allowed_tiers: list[str]) -> None:
     st.markdown(msg["content"])
-    if msg.get("sources"):
-        with st.expander(f"📎 {len(msg['sources'])} source(s)"):
-            for s in msg["sources"]:
-                st.markdown(f"**[{s['index']}] {s.get('document_filename') or s['document_id']}** (chunk {s['chunk_index']})")
-                st.caption(s["text"])
+    _response_time = _format_response_time(msg.get("response_time_ms"))
+    if _response_time:
+        st.caption(f"⏱️ {_response_time}")
+    # Sources and guardrail checks no longer render inline here — both moved
+    # to persistent, per-reply-grouped sidebar popovers (main.py's "Sources"
+    # and "Guardrail Log") so the chat transcript itself stays focused on the
+    # conversation, reachable from any page rather than only next to the one
+    # message that produced them.
     if msg.get("report"):
         r = msg["report"]
         st.info(f"📊 Report generated: **{r['title']}** ({r['format']}, {r['row_count']} rows) — see the Reports page to download it.")
@@ -183,18 +235,12 @@ def render_assistant_message(idx: int, msg: dict, allowed_tiers: list[str]) -> N
         else:
             st.caption("No alternate model tier available for your role.")
 
-    # Always visible — every guardrail check the backend ran on this turn,
-    # not gated behind the reasoning toggle below (see
-    # render_guardrail_checks()'s docstring for why).
-    if msg.get("trace"):
-        render_guardrail_checks(msg["trace"])
-
     # Off by default — the brief's "show reasoning summary" toggle
     # (sidebar Options) controls this rather than always rendering it, since
     # most of the time the answer alone is what a user wants to scan. This
     # is the full agent/tool trace (retrieval, SQL, report generation, ...);
-    # guardrail checks specifically are always shown above regardless of
-    # this toggle.
+    # guardrail checks specifically live in the sidebar's Guardrail Log
+    # instead (main.py), always available regardless of this toggle.
     if msg.get("trace") and st.session_state.get("chat_show_reasoning", False):
         render_trace(msg["trace"])
 
@@ -202,9 +248,20 @@ def render_assistant_message(idx: int, msg: dict, allowed_tiers: list[str]) -> N
 # session_state survives Streamlit's rerun-on-every-interaction model (see
 # ARCHITECTURE.md / the write-up in this conversation for why that's needed).
 if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []  # [{"role": "user"|"assistant", "content": str, "sources": [...], "report": {...}|None, "trace": [...], "model_tier": str, "degraded": bool, "degraded_reason": str|None}]
+    st.session_state.chat_messages = []  # [{"role": "user"|"assistant", "content": str, "sources": [...], "report": {...}|None, "trace": [...], "model_tier": str, "degraded": bool, "degraded_reason": str|None, "response_time_ms": float|None}]
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = None
+
+# Set (once) in the prompt-handling block below, right before its st.rerun()
+# — st.dialog's decorated function has to actually be CALLED on the render
+# pass where it should appear, and that pass only happens after the rerun,
+# so the fact that a new reply needs the popup has to survive across it.
+# Popped immediately below (not left in session_state) so the dialog shows
+# exactly once for the turn that triggered it, never again on a later
+# navigation/rerun that didn't just create a new pending approval.
+if st.session_state.get("pending_pii_dialog"):
+    _dialog_data = st.session_state.pop("pending_pii_dialog")
+    _employee_pii_approval_dialog(_dialog_data["approval_id"], _dialog_data["detail"])
 
 try:
     _capabilities = api_client.get_my_capabilities()
@@ -321,11 +378,79 @@ for idx, msg in enumerate(st.session_state.chat_messages):
 if st.session_state.chat_messages:
     st.markdown('<p class="ep-disclaimer">AI responses may be inaccurate — verify important information.</p>', unsafe_allow_html=True)
 
-# Composer toolbar — attach + model picker, directly above st.chat_input in
-# the script so it renders directly above the input bar in the browser too
-# (a plain call-order effect, not a positioning hack; st.chat_input always
-# docks to its own fixed bottom bar regardless of where it's called). Kept
-# in one stylable_container so both triggers share the same borderless,
+prompt = st.chat_input("Ask anything…") or pending_prompt
+if prompt:
+    st.session_state.chat_messages.append(
+        {"role": "user", "content": prompt, "sources": [], "report": None, "trace": [], "model_tier": None, "degraded": False}
+    )
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant", avatar="✨"):
+        with st.spinner("Thinking…"):
+            try:
+                # This one call is POST {BACKEND_URL}/chat — see api_client.send_chat_message.
+                # model_tier is only passed when the user actually has a choice (the composer
+                # model picker is a plain label, not a popover, for single-tier roles) —
+                # omitting it otherwise keeps the backend's own default-tier resolution unchanged.
+                model_tier_override = st.session_state.chat_model_tier if len(_allowed_tiers) > 1 else None
+                result = api_client.send_chat_message(
+                    prompt, conversation_id=st.session_state.conversation_id, top_k=st.session_state.chat_top_k,
+                    model_tier=model_tier_override,
+                )
+            except APIError as exc:
+                show_api_error(exc)
+                st.session_state.chat_messages.pop()  # drop the optimistic user turn, nothing was persisted
+                st.stop()
+
+        st.session_state.conversation_id = result["conversation_id"]
+        st.session_state.chat_messages.append(
+            {
+                "role": "assistant", "content": result["reply"], "sources": result["sources"],
+                "report": result["report"], "trace": result["trace"],
+                "model_tier": result["model_tier"], "degraded": result["degraded"],
+                "degraded_reason": result.get("degraded_reason"),
+                "response_time_ms": result.get("response_time_ms"),
+            }
+        )
+        render_assistant_message(len(st.session_state.chat_messages) - 1, st.session_state.chat_messages[-1], _allowed_tiers)
+        debug_json(result, "Raw /chat response")
+
+    _pii_approval = _pending_employee_pii_approval(result["trace"])
+    if _pii_approval:
+        st.session_state.pending_pii_dialog = _pii_approval
+
+    # Without this, chat_messages gains the new turn only *after* main.py's
+    # sidebar code already ran earlier in this same script execution (it's
+    # positioned before nav.run(), which is what gets here) — so the
+    # sidebar's Guardrail Log popover (and anything else there reading
+    # chat_messages) would keep showing the state from before this message,
+    # not because it doesn't read session_state correctly, but because it
+    # already finished computing its content for this run. Matches
+    # _regenerate_at()'s identical st.rerun() above for the same reason.
+    st.rerun()
+
+# Composer toolbar — attach + model picker. Deliberately rendered AFTER the
+# chat_input/prompt-handling block above, not before it (an earlier version
+# had this reversed). st.chat_input() always docks to its own fixed bottom
+# bar regardless of where it's called in the script, but the toolbar has no
+# such magic — it renders exactly where this code runs in top-to-bottom
+# order. With the toolbar positioned BEFORE the prompt handler, sending a
+# message meant the toolbar (rendered earlier in that same run) stayed put
+# while the new user/assistant turn's direct st.chat_message() calls
+# (positioned after it) appended below — visually sandwiching the toolbar
+# mid-transcript, between the previous exchange and the new "Thinking…" one,
+# for the entire duration of every single request (found live: reported as
+# "the model picker/attach option shows up after every message" — it's not
+# a popover misbehaving, it's this whole block rendering in the wrong
+# place). Moving it here means the in-flight branch above hits st.rerun()
+# and returns before this code ever executes during a pending request (no
+# toolbar shows while "Thinking…" is up, which reads as intentional, not
+# broken) — and once that rerun completes, the history loop (now including
+# the finished turn) has already fully rendered by the time this reruns
+# from the top, so the toolbar lands after ALL messages, every time.
+#
+# Kept in one stylable_container so both triggers share the same borderless,
 # hover-fill treatment and visually read as the input's own footer/toolbar
 # rather than two separate floating buttons.
 #
@@ -364,13 +489,23 @@ if _can_upload or _allowed_tiers or _capabilities:
         }}
         """,
     ):
-        # Exactly 2 columns, both always used: a narrow one for the 📎
-        # trigger (only when present) and a wider one for the model picker —
-        # a 3rd, unused column here was a real bug (its 0.76 share of the
-        # row sat empty while the model picker was squeezed into 0.18,
-        # wrapping its label letter-by-letter).
+        # 3 columns: two tightly-sized ones for the 📎 trigger and model
+        # picker, plus a trailing spacer that absorbs the rest of the row.
+        # st.columns() ratios split the FULL row width regardless of how
+        # little content a column holds — a column doesn't shrink to fit its
+        # button — so *only* 2 columns here (no spacer) left the model
+        # picker's column far wider than its own button, and since the
+        # button hugs the left edge of its column, that unused width showed
+        # up as a visible gap floating *before* the button instead of
+        # disappearing after it, reading as "attach and the model picker are
+        # in the wrong position" rather than as a cohesive toolbar. (A prior
+        # version of this went too far the other way — a 3rd spacer column
+        # so large it squeezed the model picker's own column down to 0.18,
+        # wrapping "Claude Sonnet ▾" letter-by-letter. The fix is a properly
+        # *sized* pair of columns plus a spacer, not the presence/absence of
+        # the spacer itself.)
         if _can_upload:
-            _col_attach, _col_model = st.columns([0.08, 0.3])
+            _col_attach, _col_model, _col_spacer = st.columns([0.05, 0.2, 0.75])
             with _col_attach:
                 with st.popover("📎"):
                     st.caption("Uploads to your knowledge base — indexed documents become searchable in chat right away.")
@@ -391,43 +526,9 @@ if _can_upload or _allowed_tiers or _capabilities:
             with _col_model:
                 render_model_picker(_allowed_tiers)
         else:
-            _col_model, _ = st.columns([0.3, 0.7])
+            # Same 0.2 width as _col_model above (not the old 0.3) so the
+            # model picker sits at the same horizontal position and size
+            # regardless of whether this role also gets the 📎 column.
+            _col_model, _ = st.columns([0.2, 0.8])
             with _col_model:
                 render_model_picker(_allowed_tiers)
-
-prompt = st.chat_input("Ask anything…") or pending_prompt
-if prompt:
-    st.session_state.chat_messages.append(
-        {"role": "user", "content": prompt, "sources": [], "report": None, "trace": [], "model_tier": None, "degraded": False}
-    )
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant", avatar="✨"):
-        with st.spinner("Thinking…"):
-            try:
-                # This one call is POST {BACKEND_URL}/chat — see api_client.send_chat_message.
-                # model_tier is only passed when the user actually has a choice (the composer
-                # model picker is a plain label, not a popover, for single-tier roles) —
-                # omitting it otherwise keeps the backend's own default-tier resolution unchanged.
-                model_tier_override = st.session_state.chat_model_tier if len(_allowed_tiers) > 1 else None
-                result = api_client.send_chat_message(
-                    prompt, conversation_id=st.session_state.conversation_id, top_k=st.session_state.chat_top_k,
-                    model_tier=model_tier_override,
-                )
-            except APIError as exc:
-                show_api_error(exc)
-                st.session_state.chat_messages.pop()  # drop the optimistic user turn, nothing was persisted
-                st.stop()
-
-        st.session_state.conversation_id = result["conversation_id"]
-        st.session_state.chat_messages.append(
-            {
-                "role": "assistant", "content": result["reply"], "sources": result["sources"],
-                "report": result["report"], "trace": result["trace"],
-                "model_tier": result["model_tier"], "degraded": result["degraded"],
-                "degraded_reason": result.get("degraded_reason"),
-            }
-        )
-        render_assistant_message(len(st.session_state.chat_messages) - 1, st.session_state.chat_messages[-1], _allowed_tiers)
-        debug_json(result, "Raw /chat response")

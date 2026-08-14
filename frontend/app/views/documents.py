@@ -3,6 +3,7 @@ import time
 import uuid
 
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 import api_client
 from api_client import APIError
@@ -79,6 +80,14 @@ def _run_upload_with_progress(file, previous_version_of: str | None) -> dict:
             result_box["error"] = exc
 
     thread = threading.Thread(target=_do_upload, daemon=True)
+    # A plain threading.Thread has no Streamlit ScriptRunContext, so
+    # st.session_state is invisible to it — _do_upload()'s call into
+    # api_client.upload_document() would see an empty session_state and send
+    # the request with no Authorization header at all (a real 401 "missing
+    # bearer token", not an expired-token case), no matter how recently the
+    # user logged in. add_script_run_ctx() propagates this run's context to
+    # the thread so st.session_state resolves correctly inside it.
+    add_script_run_ctx(thread)
     thread.start()
 
     progress_bar = st.progress(0.0, text=f"Uploading {file.name}…")

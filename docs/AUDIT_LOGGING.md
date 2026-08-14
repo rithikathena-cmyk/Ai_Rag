@@ -38,16 +38,23 @@ Note: `/search` doesn't call the Claude Gateway at all (it's pure retrieval, no 
 denied one does. This is an intentional scope boundary, not an oversight: this table's purpose is
 gateway/LLM usage, and search isn't an LLM request.
 
-## 3. Approval (v1 scope)
+## 3. Approval (current — supersedes the original v1-scope note below)
 
-The spec's "Approval Policies" section maps, in this repo, to `llm_rbac.yaml`'s
-`approval_required_actions` per role and `PolicyDecision.requires_approval` — currently only
-Project Manager's `delete_documents` sets this. `routers/documents.py::delete_document()` is now the
-one consumer: when `decision.requires_approval` is true, it responds `403 approval_required` (and
-still writes a `decision="denied"` audit row) rather than silently allowing the deletion. There is
-still no `ApprovalRequest` model or grant mechanism anywhere in this repo — building one wasn't in
-scope for this pass — so "requires approval" currently means "blocked until an approval workflow
-exists," not "blocked pending a real approval." See `docs/LLM_RBAC_POLICY.md` §4 for the reasoning.
+A real `ApprovalRequestModel` now exists (`app/models/approval_request.py`) and `routers/
+approvals.py` exposes `GET /approvals`, `GET /approvals/{id}`, `POST /approvals/{id}/decide` — see
+`docs/PROJECT_GOVERNANCE.md` for the original build (project submission, document deletion) and
+`docs/GUARDRAILS_ARCHITECTURE.md` §14 for the employee-PII workflow added on top of the same table.
+"Requires approval" now means "queued for a real human decision," not "blocked until an approval
+workflow exists" — every approval-gated action creates a `pending` row a decider can act on, and the
+row itself (requester, decider, decision, timestamps, reason, plus a JSONB `payload` for
+category-specific detail) is the audit record for that decision, alongside this table's own
+per-LLM-request rows. `docs/LLM_RBAC_POLICY.md` §4 has the fuller history.
+
+*Original v1-scope note, kept for context, no longer accurate*: "The spec's 'Approval Policies'
+section maps, in this repo, to `llm_rbac.yaml`'s `approval_required_actions` per role and
+`PolicyDecision.requires_approval`... `routers/documents.py::delete_document()` is now the one
+consumer: when `decision.requires_approval` is true, it responds `403 approval_required`... There is
+still no `ApprovalRequest` model or grant mechanism anywhere in this repo."
 
 ## 4. Query examples
 

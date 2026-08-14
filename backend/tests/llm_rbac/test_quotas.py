@@ -20,6 +20,50 @@ class _FakeCounterRow:
         self.cost_usd_used = cost_usd_used
 
 
+# -------------------------------------------------------------- effective_quotas
+
+def test_effective_quotas_returns_role_defaults_when_no_override_set():
+    role_quotas = {"daily_requests": 10, "daily_tokens": 1000, "monthly_tokens": 10000, "monthly_cost_usd": 50}
+    result = quotas.effective_quotas(role_quotas)
+    assert result == role_quotas
+
+
+def test_effective_quotas_daily_override_wins_over_role_default():
+    role_quotas = {"daily_tokens": 1000, "monthly_tokens": 10000}
+    result = quotas.effective_quotas(role_quotas, daily_token_limit_override=200)
+    assert result["daily_tokens"] == 200
+    assert result["monthly_tokens"] == 10000
+
+
+def test_effective_quotas_monthly_override_wins_over_role_default():
+    role_quotas = {"daily_tokens": 1000, "monthly_tokens": 10000}
+    result = quotas.effective_quotas(role_quotas, monthly_token_limit_override=2000)
+    assert result["daily_tokens"] == 1000
+    assert result["monthly_tokens"] == 2000
+
+
+def test_effective_quotas_override_can_apply_even_when_role_default_is_unlimited():
+    # CEO/Admin's real llm_rbac.yaml quotas are null (unlimited) — an Admin
+    # should still be able to cap a specific user's tokens despite that.
+    result = quotas.effective_quotas({"daily_tokens": None, "monthly_tokens": None}, daily_token_limit_override=500)
+    assert result["daily_tokens"] == 500
+    assert result["monthly_tokens"] is None
+
+
+def test_effective_quotas_leaves_non_token_fields_untouched():
+    role_quotas = {"daily_requests": 10, "requests_per_minute": 5, "max_concurrent_requests": 2}
+    result = quotas.effective_quotas(role_quotas, daily_token_limit_override=100, monthly_token_limit_override=1000)
+    assert result["daily_requests"] == 10
+    assert result["requests_per_minute"] == 5
+    assert result["max_concurrent_requests"] == 2
+
+
+def test_effective_quotas_does_not_mutate_input_dict():
+    role_quotas = {"daily_tokens": 1000}
+    quotas.effective_quotas(role_quotas, daily_token_limit_override=1)
+    assert role_quotas == {"daily_tokens": 1000}
+
+
 # ------------------------------------------------------------------ check_budget
 
 def test_check_budget_passes_when_under_every_limit(monkeypatch):

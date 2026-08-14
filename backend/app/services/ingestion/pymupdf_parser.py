@@ -1,5 +1,7 @@
-"""PDF parsing via PyMuPDF: pure C-based text/table/image extraction, used
-for all PDFs for now (Docling's OCR path is disabled for speed)."""
+"""PDF parsing via PyMuPDF: pure C-based text/table/image extraction, the
+fast-path parser tried first for every PDF. Has no OCR — dispatcher.py falls
+back to Docling's OCR pipeline when this comes back with near-zero text
+(the signature of a scanned/image-only PDF)."""
 
 from collections import Counter
 from pathlib import Path
@@ -29,8 +31,21 @@ def _is_heading_span(span: dict, body_size: float) -> bool:
     text = span.get("text", "").strip()
     if not text or len(text) > 120:
         return False
+    if span["size"] >= body_size * 1.15:
+        return True
+    # A line that's merely bold at body size (not larger) used to count as a
+    # heading on its own, which false-positives badly on dense, bold-heavy
+    # layouts like resumes: job titles ("Front End Developer"), company
+    # names, and contact-field labels ("Email", "LinkedIn") are commonly
+    # bold at body size there, and each one becoming its own heading split a
+    # single job entry into disconnected one-line "sections" (the title
+    # separated from its own bullets), fragmenting the document into dozens
+    # of near-empty chunks. Requiring ALL CAPS as well keeps real
+    # same-size-bold section titles ("SUMMARY", "EXPERIENCE") working — the
+    # conventional styling for those — while excluding bold body content
+    # that merely happens to share the section-title's font weight.
     is_bold = bool(span.get("flags", 0) & _BOLD_FLAG)
-    return span["size"] >= body_size * 1.15 or (is_bold and span["size"] >= body_size)
+    return is_bold and text.isupper()
 
 
 def _extract_text_with_headings(doc) -> tuple[str, list[str]]:

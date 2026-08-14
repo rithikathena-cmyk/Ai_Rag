@@ -66,6 +66,22 @@ def _get_or_create_resilient(db: Session, user_id: uuid.UUID, period_type: str, 
         raise AppError(503, "rbac_check_unavailable", "Unable to verify your request quota right now. Please try again shortly.") from exc
 
 
+def effective_quotas(
+    role_quotas: dict, *, daily_token_limit_override: int | None = None, monthly_token_limit_override: int | None = None
+) -> dict:
+    """Merges a per-user token-limit override (UserModel.daily_token_limit_override /
+    monthly_token_limit_override, set by Admin/CEO via PUT /users/{id}/token-limit,
+    see routers/users.py) on top of the role's default quotas from llm_rbac.yaml.
+    The override wins when set; every other quota field (requests, cost, rate limit)
+    stays role-level only — this endpoint only ever caps tokens."""
+    merged = dict(role_quotas)
+    if daily_token_limit_override is not None:
+        merged["daily_tokens"] = daily_token_limit_override
+    if monthly_token_limit_override is not None:
+        merged["monthly_tokens"] = monthly_token_limit_override
+    return merged
+
+
 def check_budget(db: Session, user_id: uuid.UUID, role_quotas: dict) -> None:
     """Raises AppError(429) if the caller's day/month request, token, or cost
     budget is already exhausted. Read-only — increment_usage() is what
@@ -119,6 +135,33 @@ def get_usage(db: Session, user_id: uuid.UUID) -> dict:
         "monthly_tokens_used": month_row.tokens_used if month_row else 0,
         "monthly_cost_usd_used": month_row.cost_usd_used if month_row else 0.0,
     }
+
+
+def reset_usage(db: Session, user_id: uuid.UUID) -> None:
+    """Zeroes a user's CURRENT day/month usage counters — the ones
+    check_budget()/get_usage() actually read. An explicit admin action (see
+    POST /users/{id}/usage/reset in routers/users.py), deliberately never an
+    automatic side effect of PUT /users/{id}/token-limit: tying a reset to
+    every limit edit would let a user who's already exhausted their quota
+    get a clean slate from any admin touch of their limit at all, silently
+    turning the quota from an abuse control into something bypassable.
+    Doesn't touch past periods — those are historical record, not a live
+    counter, so nothing to "reset" there. Caller commits."""
+    now = datetime.now(timezone.utc)
+    for period_type in ("day", "month"):
+        row = (
+            db.query(RoleUsageCounterModel)
+            .filter(
+                RoleUsageCounterModel.user_id == user_id,
+                RoleUsageCounterModel.period_type == period_type,
+                RoleUsageCounterModel.period_start == _period_start(period_type, now),
+            )
+            .one_or_none()
+        )
+        if row is not None:
+            row.tokens_used = 0
+            row.cost_usd_used = 0.0
+            row.request_count = 0
 
 
 def increment_usage(db: Session, user_id: uuid.UUID, *, tokens: int, cost_usd: float) -> None:

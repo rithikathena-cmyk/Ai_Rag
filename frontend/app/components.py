@@ -5,6 +5,8 @@ Also owns the app's design tokens and global CSS (inject_global_styles) —
 kept here rather than duplicated per-page so every view picks up the same
 look automatically through page_header()/card()/status_badge()."""
 
+import html
+
 import pandas as pd
 import streamlit as st
 from streamlit_extras.dataframe_explorer import dataframe_explorer
@@ -115,8 +117,17 @@ def inject_global_styles() -> None:
         happen to inherit from <body> directly. Every element still fell
         back to Streamlit's own default ("Source Sans Pro"). Targeting
         every descendant of the app root with !important is what actually
-        wins against Streamlit's built-in, more-specific font rules. */
-        html, body, .stApp, .stApp *:not([data-testid="stIconMaterial"]) {{
+        wins against Streamlit's built-in, more-specific font rules.
+        st.expander(icon=...)'s ligature span carries data-testid=
+        "stExpanderIcon", NOT "stIconMaterial" (confirmed via the live DOM —
+        st.Page(icon=...) nav icons are the ones that use stIconMaterial) —
+        the original exclusion here never matched an expander's icon at all,
+        so Inter always force-applied to it and the Material Symbols
+        ligature ("speed", "add", ...) rendered as literal overlapping text
+        instead of substituting to the icon glyph. Both testids need
+        excluding for icons anywhere in the app to render correctly. */
+        html, body, .stApp,
+        .stApp *:not([data-testid="stIconMaterial"]):not([data-testid="stExpanderIcon"]) {{
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
         }}
         .stApp code, .stApp pre, .stApp kbd, .stApp samp {{
@@ -263,6 +274,32 @@ def inject_global_styles() -> None:
             padding: 0.35rem 0.6rem !important; font-weight: 400;
         }}
         [data-testid="stPopoverBody"] .stButton > button:hover {{ background: {BG_SECONDARY}; color: {PRIMARY}; }}
+
+        /* activity_log_panel()'s sidebar expander — structural [data-testid]
+        rules for ANY expander have to live here globally rather than inside
+        that function's own stylable_container: empirically, only the FIRST
+        top-level rule in a stylable_container's css_styles reliably scopes
+        (same class of quirk as the popover comment above documents for
+        portal-rendered content, just for a different underlying reason —
+        here the element isn't portal-rendered, css_styles just doesn't
+        propagate its scope past the first rule for these testids). Applies
+        to every st.expander on the page (also debug_json()'s), not just
+        this one — harmless there too, same box/scroll treatment is a
+        reasonable default for any expander, not a regression.
+        The max-height+scroll is the actual size fix: without it, a long
+        session (many turns x 11 input + 5 output checks each) pushes
+        Settings/profile/sign-out far down the sidebar instead of scrolling
+        within its own bounded box. */
+        [data-testid="stExpander"] {{
+            border: 1px solid {BORDER} !important; border-radius: 10px !important;
+            background: {SURFACE} !important; box-shadow: none !important;
+        }}
+        [data-testid="stExpander"] summary {{ font-size: 0.86rem !important; padding: 0.4rem 0.6rem !important; }}
+        [data-testid="stExpander"] summary:hover {{ color: {PRIMARY} !important; }}
+        [data-testid="stExpanderDetails"] {{
+            max-height: 46vh !important; overflow-y: auto !important; overflow-x: hidden !important;
+            padding: 0.1rem 0.5rem 0.4rem !important;
+        }}
 
         /* Conversation row styling itself is injected per-row via
         stylable_container in conversation_row() below (needs the row's
@@ -462,6 +499,147 @@ def show_api_error(exc: APIError) -> None:
 def debug_json(data, label: str = "Raw response") -> None:
     with st.expander(f"🔍 {label}"):
         st.json(data)
+
+
+# routers/chat.py's _guardrail_trace() formats every guardrail
+# ChatTraceStep's summary as "{action}: {detail}" — action is always one of
+# these three literal prefixes (services/guardrails/types.py's
+# GuardrailAction), so a plain string-prefix check is exact, not a
+# heuristic. Shared here (not defined in views/chat.py) so main.py's sidebar
+# guardrail log can use the same icon/parsing convention without importing
+# a page module — Streamlit page files run top-level st.stop() guards on
+# import, which makes them unsafe to import from anywhere but their own
+# st.navigation() entry.
+GUARDRAIL_ICONS = {"pass": "✅", "block": "🚫", "redact": "✂️"}
+
+
+def guardrail_action(step: dict) -> str:
+    return step["summary"].split(":", 1)[0]
+
+
+def activity_log_panel(assistant_messages: list[dict]) -> None:
+    """Sidebar-resident (not popover) guardrail/source log — every reply's
+    checks and citations, newest first. Replaces the earlier st.popover
+    version: a popover's body renders through a BaseWeb portal with no
+    awareness of the surrounding page, so once a session accumulates enough
+    turns/checks the box grows tall/wide enough to cover other page content.
+    st.expander's body is a normal descendant in the DOM (not portal-
+    rendered), so its size is capped with an ordinary CSS max-height+scroll
+    instead — see inject_global_styles()'s [data-testid="stExpander"]/
+    stExpanderDetails rules for why that lives there and not in this
+    function's own stylable_container. The panel now lives inline in the
+    sidebar's document flow and never overlaps anything else on the page.
+
+    assistant_messages: st.session_state.chat_messages entries with
+    role == "assistant" and a non-empty trace (the caller filters this,
+    same as the popover version did) — this function only renders."""
+    turns = list(enumerate(assistant_messages, start=1))
+    all_checks = [step for _, m in turns for step in m["trace"] if step["agent"] == "Guardrails"]
+    flagged = sum(1 for c in all_checks if guardrail_action(c) != "pass")
+    total_sources = sum(len(m.get("sources") or []) for _, m in turns)
+    # :red[...] is Streamlit's own colored-markdown directive (same one
+    # status_badge() already uses below) — st.expander's label renders
+    # markdown, so this needs no custom CSS/scoping workaround, unlike the
+    # structural [data-testid=...] rules above.
+    label = f":red[🛡️ Activity Log ({flagged} flagged)]" if flagged else "🛡️ Activity Log"
+
+    with stylable_container(
+        key="activity-log-panel",
+        css_styles=f"""
+        {{
+            .al-summary {{
+                font-size: 0.7rem; color: {MUTED}; padding: 0.1rem 0.1rem 0.5rem; border-bottom: 1px solid {BORDER};
+                margin-bottom: 0.4rem;
+            }}
+            /* Per-row dynamic color (turn accent, check dot, tool-name color)
+            is driven entirely by CSS CLASSES set in the generated markup
+            below, not inline style="--x: y" custom properties — verified
+            live that Streamlit's unsafe_allow_html markdown renderer strips
+            style="..." attributes from this HTML entirely, so any custom
+            property set that way silently never reaches the DOM and every
+            var(--x, fallback) always resolves to its fallback. Classes have
+            no such problem. */
+            .al-turn {{ border: 1px solid {BORDER}; border-radius: 8px; background: {BG}; padding: 0.45rem 0.55rem; margin-bottom: 0.45rem; }}
+            .al-turn.al-clean {{ border-left: 3px solid {ACCENTS["green"]}; }}
+            .al-turn.al-flagged {{ border-left: 3px solid {ACCENTS["red"]}; }}
+            .al-turn-head {{
+                font-size: 0.76rem; font-weight: 600; color: {INK}; margin-bottom: 0.3rem;
+            }}
+            .al-turn-head.al-flagged {{ color: {ACCENTS["red"]}; }}
+            .al-preview {{ font-weight: 400; color: {MUTED}; }}
+            .al-section-label {{
+                font-size: 0.62rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+                color: {MUTED}; margin: 0.35rem 0 0.15rem;
+            }}
+            .al-check {{ display: flex; align-items: flex-start; gap: 0.4rem; padding: 0.12rem 0; font-size: 0.72rem; }}
+            .al-dot {{ width: 6px; height: 6px; border-radius: 50%; margin-top: 0.32rem; flex: 0 0 auto; }}
+            .al-dot.al-pass {{ background: {ACCENTS["green"]}; }}
+            .al-dot.al-block {{ background: {ACCENTS["red"]}; }}
+            .al-dot.al-redact {{ background: {ACCENTS["orange"]}; }}
+            /* A <span>, not <code> — Streamlit's own markdown CSS carries an
+            equal-specificity !important color rule for inline <code> that
+            wins on source order regardless of !important on this side, so
+            outscoring it isn't reliable. A plain span has no such built-in
+            styling to fight. */
+            .al-tool {{
+                font-size: 0.66rem; background: {BG_SECONDARY}; padding: 0.05rem 0.3rem; border-radius: 4px;
+                white-space: nowrap; font-weight: 600;
+            }}
+            .al-tool.al-pass {{ color: {ACCENTS["green"]}; }}
+            .al-tool.al-block {{ color: {ACCENTS["red"]}; }}
+            .al-tool.al-redact {{ color: {ACCENTS["orange"]}; }}
+            .al-detail {{ color: {MUTED}; overflow-wrap: anywhere; }}
+            .al-source {{ font-size: 0.72rem; padding: 0.25rem 0 0; border-top: 1px dashed {BORDER}; margin-top: 0.3rem; }}
+            .al-source strong {{ font-weight: 600; overflow-wrap: anywhere; }}
+        }}
+        """,
+    ):
+        with st.expander(label, expanded=False):
+            if not turns:
+                st.caption("No activity yet — start a chat.")
+                return
+
+            reply_word = "reply" if len(turns) == 1 else "replies"
+            st.markdown(
+                f'<div class="al-summary">{len(all_checks)} checks &middot; {total_sources} sources across '
+                f'{len(turns)} {reply_word} &mdash; {len(all_checks) - flagged} passed, {flagged} flagged</div>',
+                unsafe_allow_html=True,
+            )
+
+            rows: list[str] = []
+            for turn_no, m in reversed(turns):
+                checks = [s for s in m["trace"] if s["agent"] == "Guardrails"]
+                sources = m.get("sources") or []
+                turn_flagged = sum(1 for c in checks if guardrail_action(c) != "pass")
+                head_icon = "🚫" if turn_flagged else "✅"
+                preview = html.escape((m["content"] or "")[:70])
+
+                turn_class = "al-turn al-flagged" if turn_flagged else "al-turn al-clean"
+                head_class = "al-turn-head al-flagged" if turn_flagged else "al-turn-head"
+                rows.append(f'<div class="{turn_class}">')
+                rows.append(f'<div class="{head_class}">{head_icon} Reply {turn_no} <span class="al-preview">— "{preview}"</span></div>')
+                if checks:
+                    rows.append('<div class="al-section-label">Guardrail checks</div>')
+                    for check in checks:
+                        # action is always "pass"/"block"/"redact" (services/guardrails/types.py's
+                        # GuardrailAction) — matches the al-pass/al-block/al-redact CSS classes exactly.
+                        action = guardrail_action(check)
+                        detail = check["summary"].split(":", 1)[1].strip() if ":" in check["summary"] else ""
+                        rows.append(
+                            f'<div class="al-check"><span class="al-dot al-{action}"></span>'
+                            f'<span><span class="al-tool al-{action}">{html.escape(check["tool"])}</span> '
+                            f'<span class="al-detail">{html.escape(detail)}</span></span></div>'
+                        )
+                if sources:
+                    rows.append(f'<div class="al-section-label">Sources ({len(sources)})</div>')
+                    for s in sources:
+                        fname = html.escape(s.get("document_filename") or s["document_id"])
+                        rows.append(
+                            f'<div class="al-source"><strong>[{s["index"]}] {fname}</strong> '
+                            f'(chunk {s["chunk_index"]})</div>'
+                        )
+                rows.append("</div>")
+            st.markdown("".join(rows), unsafe_allow_html=True)
 
 
 def status_badge(status: str) -> str:

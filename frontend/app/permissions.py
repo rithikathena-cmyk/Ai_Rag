@@ -19,6 +19,7 @@ VIEW_ROLES = "VIEW_ROLES"
 MANAGE_ROLES = "MANAGE_ROLES"
 VIEW_AUDIT_LOGS = "VIEW_AUDIT_LOGS"
 SYSTEM_SETTINGS = "SYSTEM_SETTINGS"
+MANAGE_EMPLOYEE_PII = "MANAGE_EMPLOYEE_PII"
 
 
 def has_permission(capabilities: dict | None, permission: str) -> bool:

@@ -114,8 +114,17 @@ def _login(client: TestClient, email: str, password: str) -> dict:
 def test_full_live_chat_flow_login_through_persisted_redacted_history(live_client, throwaway_user):
     """login -> RBAC model-tier resolution -> real Qdrant retrieval -> real
     Anthropic generation -> DualText PII split -> redacted citation ->
-    redacted conversation-history persistence, exactly as manually verified
-    against WM_1.pdf during the model-availability investigation."""
+    redacted conversation-history persistence.
+
+    Targets the Line 7 packaging-line incident report
+    (mfg_incident_report_line7_stoppage.md) — a purpose-built synthetic PII
+    test record (see that file's own header) that's actually present in the
+    current seeded corpus, unlike the WM_1.pdf document this test originally
+    targeted (removed from the corpus at some point after this test was
+    written; hardcoding a specific filename as an assertion is exactly the
+    kind of thing that goes stale when the corpus is re-seeded, so the fixed
+    checks below deliberately don't repeat that mistake for whichever
+    document ends up serving this query)."""
     email, password = throwaway_user
     headers = _login(live_client, email, password)
 
@@ -127,10 +136,13 @@ def test_full_live_chat_flow_login_through_persisted_redacted_history(live_clien
     allowed_tiers = caps.json()["model_tiers_allowed"]
     assert allowed_tiers == ["haiku"], f"Employee role must be haiku-only, got {allowed_tiers}"
 
-    # Real retrieval + real generation: the same warranty question verified
-    # manually against WM_1.pdf. model_tier is passed explicitly, exercising
-    # the same "select a model" step the chat UI's model picker drives.
-    question = "What warranty support information is available in the documents?"
+    # Real retrieval + real generation, against a document confirmed present
+    # in the current corpus and confirmed to carry real contact-info PII
+    # (phone/email) for the redaction check below to be meaningful, not a
+    # vacuous pass over sources with nothing to redact. model_tier is passed
+    # explicitly, exercising the same "select a model" step the chat UI's
+    # model picker drives.
+    question = "Who reported the Line 7 packaging line stoppage, and what's their contact phone number?"
     chat = live_client.post("/chat", json={"message": question, "model_tier": "haiku"}, headers=headers)
     assert chat.status_code == 200, chat.text
     body = chat.json()
@@ -141,12 +153,12 @@ def test_full_live_chat_flow_login_through_persisted_redacted_history(live_clien
     assert body["degraded_reason"] is None
     assert len(body["reply"]) > 0
 
-    # Citation metadata: at least one source must be WM_1.pdf, and every
-    # source must carry the fields a citation needs to be independently
-    # verifiable against Postgres (not just a bare text blob).
+    # Citation metadata: every source must carry the fields a citation needs
+    # to be independently verifiable against Postgres (not just a bare text
+    # blob). Deliberately does NOT assert on a specific document_filename —
+    # that's the exact staleness trap the removed WM_1.pdf assertion fell
+    # into once the corpus was re-seeded with different documents.
     assert body["sources"], "expected at least one retrieved source"
-    wm1_sources = [s for s in body["sources"] if s.get("document_filename") == "WM_1.pdf"]
-    assert wm1_sources, f"expected WM_1.pdf among citations, got {[s.get('document_filename') for s in body['sources']]}"
     for s in body["sources"]:
         assert s["document_id"], "citation missing document_id"
         assert s["chunk_id"], "citation missing chunk_id"
@@ -154,9 +166,9 @@ def test_full_live_chat_flow_login_through_persisted_redacted_history(live_clien
 
     # PII redaction (DualText.display): no raw-looking phone number reaches
     # any user-facing source text. This is a substring check across ALL
-    # sources — the specific chunk that carries WM_1.pdf's phone number is
-    # an implementation detail of the current chunking strategy, not
-    # something this test should hardcode.
+    # sources — the specific chunk that carries the incident report's phone
+    # number is an implementation detail of the current chunking strategy,
+    # not something this test should hardcode.
     for s in body["sources"]:
         assert not PHONE_RE.search(s["text"]) or "REDACTED" in s["text"], (
             f"raw-looking phone number leaked into user-facing source: {s['text']!r}"
@@ -176,6 +188,63 @@ def test_full_live_chat_flow_login_through_persisted_redacted_history(live_clien
         assert not PHONE_RE.search(s["text"]) or "REDACTED" in s["text"], (
             f"raw-looking phone number leaked into persisted conversation history: {s['text']!r}"
         )
+
+
+def test_authorized_pii_is_answered_and_then_redacted_live(live_client, throwaway_user):
+    """Live counterpart to tests/test_chat_authorized_pii_grounding.py's
+    mocked D/E/F tests — this one exercises the actual thing those tests
+    can't (see that file's own docstring on why): does Claude, given real
+    authorized source content containing PII, actually USE it in the
+    reply (per prompts/planner_agent_v4.yaml's added instruction) instead
+    of self-censoring — the original bug ("Reported by the Shift Lead for
+    Line 7. I can't provide their contact information.") this prompt change
+    exists to fix.
+
+    Genuinely probabilistic, not a deterministic guarantee — no system
+    prompt wording forces a specific model output every run. The name
+    assertion below is the primary, more-reliable signal (a full refusal
+    omits it entirely; an answer that engages with the source includes it
+    almost always); the redacted-contact-info assertions are asserted too
+    but are the part most likely to occasionally vary run to run. An
+    occasional flake here is a real signal about generation behavior worth
+    looking at, not a test bug to silence — do not loosen these assertions
+    to make the test merely non-flaky without first checking a failure is
+    actually the same old self-censoring behavior recurring."""
+    email, password = throwaway_user
+    headers = _login(live_client, email, password)
+
+    question = "Who reported the Line 7 packaging line stoppage, and what's their contact phone number and email?"
+    chat = live_client.post("/chat", json={"message": question, "model_tier": "haiku"}, headers=headers)
+    assert chat.status_code == 200, chat.text
+    body = chat.json()
+
+    assert body["degraded"] is False, f"unexpected degraded response: {body}"
+    reply = body["reply"]
+
+    # C: the reply actually engages with the authorized source rather than
+    # declining — the reporter's name (not PII pii.py's own recognizers
+    # redact; see pii.py's recognizer list) is the clearest signal of that.
+    assert "Diego Marsh" in reply, (
+        f"expected the reporter's name in the answer (self-censoring regression?), got: {reply!r}"
+    )
+    # D/E: the output pipeline still caught and redacted the contact info
+    # Claude included, rather than either leaking it raw or having nothing
+    # to redact because Claude withheld it.
+    assert not PHONE_RE.search(reply) or "REDACTED" in reply, (
+        f"raw-looking phone number leaked into the reply: {reply!r}"
+    )
+    assert "@" not in reply or "REDACTED" in reply, f"raw-looking email leaked into the reply: {reply!r}"
+
+    # F: same guarantee extended to sources and persisted history, matching
+    # the sibling test above.
+    for s in body["sources"]:
+        assert not PHONE_RE.search(s["text"]) or "REDACTED" in s["text"]
+
+    conv_id = body["conversation_id"]
+    conv = live_client.get(f"/conversations/{conv_id}", headers=headers)
+    assistant_msgs = [m for m in conv.json()["messages"] if m["role"] == "assistant"]
+    assert assistant_msgs
+    assert not PHONE_RE.search(assistant_msgs[-1]["content"]) or "REDACTED" in assistant_msgs[-1]["content"]
 
 
 def test_admin_kill_switch_produces_accurate_degraded_reason_live(live_client, throwaway_user):

@@ -46,18 +46,30 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+class _RefreshUnreachable(Exception):
+    """Raised when the /auth/refresh call itself couldn't be completed
+    (network error, backend down/restarting) — distinct from the refresh
+    token being genuinely rejected. Not evidence the refresh token is bad,
+    so callers must NOT clear the session over it (that would silently log
+    the user out over a transient connectivity blip, e.g. the backend
+    process restarting)."""
+
+
 def _try_refresh() -> bool:
     """Attempts one access-token refresh using the stored refresh_token.
     Returns True on success (session_state's access_token is updated in
-    place); False if there's no refresh_token or the refresh itself fails —
-    callers should treat False as "give up, the user needs to log in again"."""
+    place); False if there's no refresh_token or the backend genuinely
+    rejected it — callers should treat False as "give up, the user needs to
+    log in again." Raises _RefreshUnreachable if the backend couldn't be
+    reached at all; see that class's docstring for why callers must handle
+    it separately from a plain False."""
     refresh_token = st.session_state.get("refresh_token")
     if not refresh_token:
         return False
     try:
         response = _session.post(f"{BACKEND_URL}/auth/refresh", json={"refresh_token": refresh_token}, timeout=10)
-    except requests.exceptions.RequestException:
-        return False
+    except requests.exceptions.RequestException as exc:
+        raise _RefreshUnreachable(str(exc)) from exc
     if not response.ok:
         return False
     st.session_state["access_token"] = response.json()["access_token"]
@@ -95,7 +107,15 @@ def _request(method: str, path: str, *, timeout: float = DEFAULT_TIMEOUT, _retri
     # missing/invalid one (never logged in, or the refresh token itself is
     # dead) isn't recoverable here — surface it as a normal APIError instead.
     if response.status_code == 401 and not _retried and st.session_state.get("refresh_token"):
-        if _try_refresh():
+        try:
+            refreshed = _try_refresh()
+        except _RefreshUnreachable:
+            # Couldn't even reach the backend to attempt the refresh — leave
+            # the session intact (the refresh_token itself was never actually
+            # checked) and surface a normal, retryable error instead of
+            # silently logging the user out.
+            raise APIError(f"Could not reach the backend at {BACKEND_URL} to refresh your session. Is it running?")
+        if refreshed:
             return _request(method, path, timeout=timeout, _retried=True, **kwargs)
         clear_session_auth()
 
@@ -318,6 +338,29 @@ def update_user(user_id: str, role: str | None = None, is_active: bool | None = 
     return _request("PATCH", f"/users/{user_id}", json=body)
 
 
+def set_user_token_limit(user_id: str, daily_tokens: int | None, monthly_tokens: int | None) -> dict:
+    # Admin/CEO-only on the backend (require_role) — PUT semantics: the body
+    # is the full desired override state, so passing None for a field clears
+    # that override back to the role default rather than leaving it untouched.
+    return _request(
+        "PUT", f"/users/{user_id}/token-limit",
+        json={"daily_tokens": daily_tokens, "monthly_tokens": monthly_tokens},
+    )
+
+
+def get_user_usage(user_id: str) -> dict:
+    # Admin/CEO-only — lets the token-limit editor show a target user's
+    # current usage before deciding whether to change their limit or reset it.
+    return _request("GET", f"/users/{user_id}/usage")
+
+
+def reset_user_usage(user_id: str) -> dict:
+    # Admin/CEO-only, same as set_user_token_limit above — but a deliberately
+    # separate call/action, never bundled into the token-limit save. See
+    # reset_usage()'s docstring in services/llm_rbac/quotas.py for why.
+    return _request("POST", f"/users/{user_id}/usage/reset")
+
+
 def get_user_preferences(user_id: str) -> dict:
     return _request("GET", f"/users/{user_id}/preferences")
 
@@ -396,6 +439,25 @@ def get_roles() -> dict:
     """Read-only per-role permission/tool/quota summary — VIEW_ROLES-gated
     (CEO/Admin). See views/roles.py."""
     return _request("GET", "/admin/roles")
+
+
+# -------------------------------------------------------------- approvals ---
+
+def list_approvals(status: str = "pending", limit: int = 50, offset: int = 0) -> dict:
+    return _request("GET", "/approvals", params={"status": status, "limit": limit, "offset": offset})
+
+
+def get_approval(approval_id: str) -> dict:
+    return _request("GET", f"/approvals/{approval_id}")
+
+
+def decide_approval(approval_id: str, decision: str, reason: str | None = None, values: dict | None = None) -> dict:
+    body: dict[str, Any] = {"decision": decision}
+    if reason:
+        body["reason"] = reason
+    if values:
+        body["values"] = values
+    return _request("POST", f"/approvals/{approval_id}/decide", json=body)
 
 
 # ------------------------------------------------------------ evaluation ---

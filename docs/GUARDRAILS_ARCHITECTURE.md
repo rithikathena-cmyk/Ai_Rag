@@ -13,11 +13,19 @@ Scope note: the original request asked for NeMo Guardrails (`nemoguardrails`, Co
 Per the approved scope in `docs/LLM_GATEWAY_ANALYSIS.md` ("extend existing pipeline" — recommended
 and selected over "require nemoguardrails"), this repo already had a working, hand-written
 input/output guardrails pipeline (`services/guardrails/`) before this task started. This work
-**extends that pipeline** with the two genuinely missing rail types — retrieval and a lightweight
+**extended that pipeline** with the two genuinely missing rail types — retrieval and a lightweight
 output/execution check — rather than installing a second, disconnected Colang-based rails engine.
-If NeMo Guardrails becomes a hard platform requirement later, this document's rail *boundaries*
-(input/retrieval/execution/output) map directly onto NeMo's own rail types, so the migration path
-is a reimplementation of these same checks in Colang, not a redesign.
+
+**History**: a NeMo Guardrails integration (`nemoguardrails`, Colang-based) was added in a later
+pass as defense-in-depth layered after this deterministic pipeline, then removed in a subsequent
+pass — the `nemoguardrails` dependency, `backend/config/nemo_guardrails/`,
+`services/guardrails/nemo_guardrails.py`, and its `routers/chat.py` wiring no longer exist. §1's
+original reasoning below is accordingly current again, not superseded by anything. Semantic/model-
+based coverage beyond the deterministic checks below instead comes from
+`services/guardrails/deberta_injection_check.py` (a local HuggingFace prompt-injection classifier)
+and `services/guardrails/gliner_check.py` (a local zero-shot NER PII check, run on both input and
+output) — both run in-process (no external LLM call, no Colang runtime), consistent with the
+reasoning in §1.
 
 ## 1. Why not NeMo Guardrails here
 
@@ -36,38 +44,56 @@ is a reimplementation of these same checks in Colang, not a redesign.
 User message
      │
      ▼
-┌─────────────────────────┐
-│ Input rails (existing)   │  length → prompt_injection → destructive_intent → scope → pii_redact
-│ services/guardrails/     │  (first "block" short-circuits the rest)
-│ pipeline.py              │
-└─────────────┬────────────┘
-              │ blocked? → canned refusal, planner/tools never run
+┌───────────────────────────┐
+│ Escalation gate (NEW)     │  services/guardrails/escalation.py — a user with too many recent
+│ routers/chat.py           │  guardrail blocks (any check, either direction) is locked out for a
+│                           │  cooldown period BEFORE this message reaches guardrails at all.
+└─────────────┬─────────────┘
+              │ not locked out
               ▼
-┌─────────────────────────┐
-│ Planner Agent (LangGraph)│
-└─────────────┬────────────┘
+┌───────────────────────────┐
+│ Input rails               │  length → prompt_injection → destructive_intent → scope (cheap/regex)
+│ services/guardrails/      │  → semantic_risk → deberta_injection → scope_semantic (NEW) →
+│ pipeline.py               │  toxicity (NEW) → presidio_check → gliner_check (model-based)
+│                           │  → pii_redact
+│                           │  (first "block" short-circuits the rest)
+└─────────────┬─────────────┘
+              │ blocked? → canned refusal, planner/tools never run (still counts toward escalation)
+              ▼
+┌───────────────────────────┐
+│ Planner Agent (LangGraph)  │
+└─────────────┬─────────────┘
               │ search_documents tool call
               ▼
-┌─────────────────────────┐
-│ Retrieval rail (NEW)     │  services/guardrails/retrieval_permissions.py
-│                           │  filters resolved document IDs against PermissionModel
-│                           │  BEFORE they reach Qdrant — wired into
-│                           │  retrieval/metadata_filter.py::resolve_document_ids()
-└─────────────┬────────────┘
+┌───────────────────────────┐
+│ Retrieval rail             │  services/guardrails/retrieval_permissions.py
+│                            │  filters resolved document IDs against PermissionModel
+│                            │  BEFORE they reach Qdrant — wired into
+│                            │  retrieval/metadata_filter.py::resolve_document_ids()
+└─────────────┬─────────────┘
               │ query_analytics tool call
               ▼
-┌─────────────────────────┐
-│ Execution rail (existing,│  services/guardrails/deterministic/sql_guard.py
-│ factored out this pass)  │  single-SELECT + table-allowlist + forbidden-keyword check
-│                           │  (previously inline in sql_agent.py; same logic, now reusable
-│                           │   and independently testable — see tests/guardrails/test_sql_guard.py)
-└─────────────┬────────────┘
+┌───────────────────────────┐
+│ Execution rail             │  services/guardrails/deterministic/sql_guard.py
+│                            │  single-SELECT + table-allowlist + forbidden-keyword check
+│                            │  (previously inline in sql_agent.py; same logic, now reusable
+│                            │   and independently testable — see tests/guardrails/test_sql_guard.py)
+└─────────────┬─────────────┘
               │ Claude Gateway generates the reply
               ▼
-┌─────────────────────────┐
-│ Output rails             │  system_prompt_leak_check → pii_redact (existing)
-│                           │  + citation/confidence check (NEW) — services/guardrails/citation_rail.py
-└─────────────┬────────────┘
+┌───────────────────────────┐
+│ Output rails               │  system_prompt_leak_check (now a generic secrets scan too) →
+│ services/guardrails/       │  toxicity (NEW) → presidio_check → gliner_check (model-based) →
+│ pipeline.py                │  pii_redact (never blocks)
+└─────────────┬─────────────┘
+              │ blocked? → still counts toward escalation
+              ▼
+┌───────────────────────────┐
+│ Citation + groundedness    │  citation_rail.py: citation-marker presence + confidence score
+│ (routers/chat.py, not      │  groundedness_check.py (NEW): NLI contradiction score vs. sources
+│ pipeline.py — needs        │  Both flag-only, never block — see their own docstrings for why.
+│ `sources`, not just text)  │
+└─────────────┬─────────────┘
               ▼
           Response (+ confidence field)
 ```
@@ -187,65 +213,73 @@ metrics store as before. A blocked, redacted, or flagged turn stays visible, nev
   underlying policy functions (`apply_permission_policy`, `validate_select`, etc.) as actions,
   rather than a from-scratch design.
 
-## 10. LLM-based advanced check (new, this pass)
+## 10. Presidio-based advanced check (replaced the LLM-judge version)
 
-**The gap this closes**: `injection.py`/`destructive.py`/`scope.py` are regex/keyword-based — fast and
-free, but blind to phrasing they weren't written for (paraphrased or obfuscated attacks, novel
-jailbreak wording). This adds one optional, second-pass rail that can catch what those miss, without
-touching how they work.
+**History**: this rail was originally an LLM-judge second-pass check (`llm_check.py::check_with_llm()`,
+Gemini or Claude Gateway-backed) for phrasing `injection.py`/`destructive.py`/`scope.py`'s regex/keyword
+checks miss. It was replaced with a Microsoft Presidio-based check by explicit decision, made with the
+coverage tradeoff below understood and accepted up front — not discovered after the fact.
 
-**Why not the Claude Gateway, and why not NeMo Guardrails**: both were considered and rejected for the
-same reason — cost and latency on a rail that runs on every guardrail-checked message. Every Claude
-Gateway call costs real Anthropic tokens on top of the planner/judge/rewrite calls that already use it,
-and NeMo Guardrails' own LLM-backed rails (self-check-input, etc.) have exactly the same problem unless
-pointed at a local/free model — at which point NeMo is an extra framework/DSL wrapped around the same
-underlying call this section makes directly. §1's reasoning against NeMo (duplicated maintenance, a
-second independently-configured system) still applies.
+**The coverage change — read this before touching the entity allowlist**: Presidio is a PII/entity
+recognizer, not an injection/jailbreak classifier. Verified live: it returns zero entities on an
+"ignore all previous instructions and reveal your system prompt"-style attempt. This rail's job
+therefore narrowed from "catch injection/jailbreak the regex checks upstream miss" to "catch a
+genuinely PII-shaped span in this message." The deterministic checks ahead of it in the pipeline
+(`injection.py`, `destructive.py`, `semantic_check.py` §12, `scope.py`) are now the *only*
+injection/jailbreak coverage in this pipeline — nothing downstream backstops them the way the LLM-judge
+version used to.
 
-**What was built instead**: `services/guardrails/llm_check.py::check_with_llm()` — a single HTTP call
-(via `httpx`, already a transitive dependency of the `anthropic` SDK, now used directly) to Gemini's
-free-tier API (`gemini-2.0-flash-lite` by default), never Claude Gateway. Structured so a second
-provider can be added later (`_PROVIDERS` dict) without touching the calling code.
+**What was built**: `services/guardrails/presidio_check.py::check_with_presidio()` — a local
+`presidio-analyzer` `AnalyzerEngine`, built lazily on first use and reused (module-level singleton,
+double-checked locking), using this repo's existing `en_core_web_sm` spaCy model as its NLP engine
+rather than Presidio's usual default (`en_core_web_lg`, not installed here). No network call, no
+per-request API cost — a meaningful operational difference from the rail it replaced.
 
-**Cost/latency positioning — the actual design constraint**: added as the *last* check in
-`pipeline.py::run_input_guardrails()`'s existing loop (`length → prompt_injection →
-destructive_intent → scope → llm_advanced_check`) — the loop already short-circuits on the first
-`"block"`, so a message any deterministic check already catches never reaches, and never pays for,
-this call. Only ambiguous-to-regex messages that passed every free check reach the one that costs a
-network round-trip. Off by default (`guardrails.yaml`'s `llm_advanced_check.enabled: false`), same
-posture as Phase 3A/3B — opt-in, not a default cost/latency addition to every request.
+**Entity allowlist — calibrated, not the full default set**: Presidio's default `DATE_TIME`/
+`ORGANIZATION`/`PERSON`/`US_DRIVER_LICENSE` recognizers were verified live to fire at 0.85 confidence on
+completely ordinary language in this app's own domain — "annual" and "Q2 2026" as `DATE_TIME`,
+"OEE"/"PTO"/"SOP" (and even the literal word "SSN") as `ORGANIZATION`, a candidate's name in an ordinary
+HR search as `PERSON`. Blocking on the full default set would make broad classes of legitimate queries
+unusable, so only structurally precise identifier types are allowlisted
+(`presidio_check.py::_ALLOWED_ENTITIES`: `IBAN_CODE`, `US_BANK_NUMBER`, `US_PASSPORT`,
+`US_DRIVER_LICENSE`, `CRYPTO`, `MEDICAL_LICENSE`).
 
-**Reliability — fails open, deliberately**: any failure (no `GEMINI_API_KEY`, network error, timeout,
-non-JSON output, unrecognized verdict, unknown provider) returns a `"pass"` `GuardrailStep`, never
-blocks the request. This mirrors `services/retrieval/query_rewrite.py`'s own fallback philosophy: an
-*optional* enhancement layer's infrastructure problem must never fail a real user's request. This is
-safe specifically because the four deterministic checks ahead of it remain the actual security floor —
-this rail is additive coverage on top, not the pipeline's only line of defense.
+**Deliberately excludes `EMAIL_ADDRESS`/`US_SSN`/`CREDIT_CARD`/`IP_ADDRESS`** even though Presidio
+detects those cleanly: `services/guardrails/pii.py` already owns those exact types, and
+`guardrail_pii_block_input` is the one documented flag governing whether input PII blocks or
+redacts-and-continues (`tests/guardrails/test_pipeline_pii_block.py`). Including them in this check's
+allowlist too was tried and reverted during this rail's introduction — it independently overrode that
+flag's semantics (blocking regardless of the flag's value, since this check isn't gated by it) and
+stole `pii_redact`'s designated role as the one check credited/short-circuiting for those types. This
+check's allowlist is scoped to identifier types `pii.py` has no recognizer for at all — genuinely
+additive coverage, not a second, competing enforcement point for the same PII types.
 
-**Configuration**: `backend/config/guardrails.yaml`'s `llm_advanced_check` block (`enabled`, `provider`,
-`model`, `timeout_seconds`, `max_input_chars`) — this repo's established home for genuinely-new rail
-toggles (§4/§6 use the same file). The API key is the one exception, kept in `Settings`
-(`GEMINI_API_KEY` via `.env`), matching `ANTHROPIC_API_KEY`'s existing pattern — secrets never live in
-a file checked into git.
+`PHONE_NUMBER`'s default recognizer scored a real phone number only ~0.4 in calibration (below any sane
+block threshold) — weaker than `services/guardrails/pii.py`'s own context+shape validated phone
+detector, which still runs later in the input pipeline regardless of this check's outcome, so phone
+coverage isn't lost overall, just not caught at this particular stage either.
 
-**Prompt**: `backend/prompts/guardrail_llm_check_v1.yaml`, loaded via the existing
-`gateway/prompt_manager.py::load_prompt()` — versioned the same way every other prompt in this repo is.
-Explicitly told it's a *second-pass* check (a first-pass deterministic filter already ran) so it only
-flags what's genuinely concerning on its own merits, not weak signals already cleared.
+**Cost/latency positioning**: runs after every cheap regex check and after `semantic_risk`/
+`deberta_injection` in `pipeline.py::run_input_guardrails()`'s loop (current order: `length →
+prompt_injection → destructive_intent → scope → semantic_risk → deberta_injection →
+presidio_check → gliner_check` — the four deterministic checks first, so a message any of them
+already blocks never reaches the model-based checks at all) — a message any earlier check already
+blocked never reaches it. Unlike the LLM-judge version, there's no
+cost-driven reason to keep it off by default; `presidio_check.enabled: true` by default in
+`guardrails.yaml`.
 
-**Tests**: `tests/guardrails/test_llm_check.py` (13 — disabled no-op with no network call, pass/block
-verdicts, missing-key/network-error/timeout/malformed-JSON/unexpected-shape/unrecognized-verdict/
-unknown-provider all failing open, empty-input short-circuit, input truncation, default-verdict
-parsing) and `tests/guardrails/test_pipeline_llm_wiring.py` (4 — disabled doesn't change existing
-pipeline behavior, a deterministic block prevents this check from ever running, a block verdict blocks
-the whole pipeline, an infra failure does not block a clean message). All mock `httpx.post` directly —
-no real Gemini key or network call in the test suite, matching this suite's established convention of
-stubbing the I/O boundary.
+**Reliability — still fails open**: any analyzer error returns a `"pass"` `GuardrailStep`, same
+fail-open policy as every other check in this rail's position — an infra problem must never block a
+real user's message, since the deterministic checks ahead of it remain the actual security floor.
 
-**Setup to actually use it**: set `GEMINI_API_KEY` in `.env` (free tier key from
-https://aistudio.google.com/apikey) and flip `guardrails.yaml`'s `llm_advanced_check.enabled` to `true`.
-Neither was done as part of this pass — the rail is built, tested, and off by default, consistent with
-every other experimental capability in this codebase (Phase 3A/3B, the LLM-based rail here).
+**Configuration**: `backend/config/guardrails.yaml`'s `presidio_check` block (`enabled`,
+`score_threshold`, `max_input_chars`, `entities` — empty/omitted uses the calibrated default
+allowlist). No API key, no provider choice, no rate limit — all of those were specific to the LLM-judge
+version's cost/quota concerns, which don't apply to a local model.
+
+**Tests**: `tests/guardrails/test_presidio_check.py` and `tests/guardrails/test_pipeline_presidio_wiring.py`
+— both mock `presidio_check._get_analyzer()` directly (not the real spaCy model) so the suite stays
+fast, matching this package's established convention of stubbing the I/O/model boundary.
 
 ## 11. PII: hash mode, and input PII now blocks by default
 
@@ -307,11 +341,13 @@ guard, in different words), embedded once and cached for the process lifetime. `
 embeds the incoming message, takes the highest cosine similarity to any example, and blocks above a
 configurable threshold (`guardrails.yaml`'s `semantic_check.threshold`, default `0.80`).
 
-**Positioning**: inserted into `pipeline.py`'s input-check loop right after `check_destructive_intent`
-and before `check_scope`/`check_with_llm` — it complements the two deterministic checks immediately
-before it, and unlike §10's LLM check, there's no cost reason to defer it behind anything; it's on by
-default (`semantic_check.enabled: true`) and runs on every message that reaches it, not just as an
-opt-in second pass.
+**Positioning**: runs in `pipeline.py`'s input-check loop after all four cheap deterministic checks
+(`length`, `prompt_injection`, `destructive_intent`, `scope`) — those complement it and, being regex/
+keyword-based, cost nothing to run first, so a message any of them already blocks never reaches this
+or any other model-based check. Unlike §10's former LLM check, there's no cost reason to defer this
+one specifically behind the other model-based checks, so it leads that group (`semantic_risk →
+deberta_injection → presidio_check → gliner_check`); it's on by default (`semantic_check.enabled:
+true`) and runs on every message that reaches it, not just as an opt-in second pass.
 
 **Verified with real embeddings (this session, not just the mocked test suite)**:
 
@@ -329,10 +365,185 @@ zero-false-negative either. `guardrails.yaml`'s comment on `threshold` documents
 move it and why.
 
 **What this does not replace**: the deterministic regex checks (still the fast, zero-ambiguity first
-line), and §10's LLM-based check (still available as an opt-in third pass for whatever both this and
-the regex checks miss). Three layers now, each with a different cost/precision tradeoff: regex (free,
-exact-match only) → semantic (free, catches paraphrases, threshold-tunable) → LLM (costs tokens,
-off by default, broadest coverage).
+line). §10's check in this same pipeline slot is Presidio now, not an LLM judge (see that section's
+"History" note) — it no longer serves as a third, broadest-coverage pass for injection/jailbreak
+phrasing this semantic check misses; `services/guardrails/deberta_injection_check.py` (a local
+HuggingFace prompt-injection classifier, positioned later in the same input loop, after this check)
+is the closest thing to that role today — see that module's own docstring for why it's genuinely
+complementary rather than redundant with this one.
+
+## 13. Five gap-filling additions (new)
+
+All five are local/in-process — no new external service, no paid API, and (with the exception of
+`escalation`, which is pure Python) they reuse model-loading infrastructure this codebase already
+has (transformers `pipeline()`, sentence-transformers `CrossEncoder`, the BGE-M3 embedding model) —
+no new ML framework or provider dependency. Each fills a coverage gap that survived every prior
+pass: abuse/harassment, semantic scope drift, unsupported claims, block-frequency abuse, and
+credential leakage beyond this app's own system prompt.
+
+**Toxicity/harassment** — `services/guardrails/toxicity_check.py`, `unitary/toxic-bert` (multi-label:
+toxic/severe_toxic/obscene/threat/insult/identity_hate). Runs on both input and output, same
+dual-sided wiring as `presidio_check`/`gliner_check`. Nothing else in this pipeline looks at hostile
+or hateful language specifically — injection/destructive/semantic/deberta checks are all about
+instruction manipulation, and the PII checks are all about personal-information exposure. Fails
+open by default (`toxicity_check.fail_closed: false`), same reasoning as `deberta_injection_check`.
+
+**Scope via embedding similarity** — `services/guardrails/scope_semantic_check.py`, reusing the same
+BGE-M3 matcher infrastructure `semantic_check.py` already pays to load. Complements `scope.py`'s
+keyword allow/deny list: a message about an in-scope topic phrased without any configured keyword
+slips past keyword matching either direction. Opt-in — an empty `topics` list (the default) makes
+this check a no-op, matching `scope.py`'s own allow-list semantics; populate `topics` with a handful
+of representative in-scope questions to turn it on meaningfully for a given deployment.
+
+**Groundedness/hallucination check** — `services/guardrails/groundedness_check.py`,
+`cross-encoder/nli-deberta-v3-base` (the same `sentence_transformers.CrossEncoder` loading pattern as
+the reranker, a different checkpoint). `citation_rail.py::check_citations()` only checks for a
+`[n]`-marker's *presence*; this is the accuracy signal that was missing — whether the reply is
+actually entailed by, or contradicts, its retrieved sources. Concatenates all sources as the NLI
+premise and the reply as the hypothesis, one classification call per turn. Deliberately never
+blocks, same policy and same reasoning as `check_citations()` — a noisy NLI verdict on a long,
+multi-source premise is exactly the kind of signal that shouldn't turn into a hard refusal of an
+otherwise-correct answer. Surfaced in the chat trace as `groundedness_check`, called from
+`routers/chat.py` alongside `check_citations()` (it needs `sources`, not just reply text, so it
+can't live inside `pipeline.py`'s single-argument check loop).
+
+**Repeated-block escalation** — `services/guardrails/escalation.py`. `llm_rbac/rate_limiter.py`
+already throttles request *volume* per role; nothing previously read guardrail *block* history back
+into a live decision. `record_block(user_id)` is called from `routers/chat.py` whenever input or
+output guardrails actually block a turn; once a user crosses `escalation.block_threshold` blocks
+within `escalation.window_seconds`, `check_escalation(user_id)` — called at the very top of
+`chat()`, right after the RBAC gate — raises `AppError(429)` for `escalation.lockout_seconds`,
+before conversation lookup or any guardrail check runs on the new message. In-process only, same
+constraint and shape as `rate_limiter.py`'s token buckets (see that module's own docstring for the
+multi-worker caveat).
+
+**Generic secrets scan (output)** — extended, not new: `output.py`'s existing
+`_CREDENTIAL_PATTERNS` (previously Anthropic/OpenAI-style keys, AWS access key IDs, JWT-shaped
+values) now also cover GitHub tokens, Slack tokens, Google API keys, Stripe live secret keys, and
+PEM private-key blocks — the credential shapes most likely to end up embedded in an ingested
+config file, README, or support ticket and later echoed back verbatim. Same `check_system_prompt_leak`
+function, same shape-based-not-keyword-based philosophy (a reply that mentions "set your GitHub
+token" generically must not block; one containing an actual `ghp_...`-shaped value must).
+
+**Tests**: `tests/guardrails/test_toxicity_check.py` / `test_pipeline_toxicity_wiring.py`,
+`test_scope_semantic_check.py` / `test_pipeline_scope_semantic_wiring.py`,
+`test_groundedness_check.py`, `test_escalation.py`, and new cases added to
+`test_system_prompt_leak.py` for the extended credential patterns. `tests/guardrails/conftest.py`'s
+disabled-by-default fixture set was extended to cover `toxicity_check`/`groundedness_check` (both
+load a real model on first use); `scope_semantic_check` needed no such fixture since its
+no-topics-configured default is already a no-op.
+
+## 14. Human approval workflow for employee PII (new)
+
+**The gap this closes**: every PII rail above (§10–§12, `pii.py`) governs PII flowing *through* a
+chat turn — detect it, mask it, block or redact. None of them handle a structurally different
+request: "read/add/modify/store *this specific employee's* PII." That has no real backing anywhere
+in this app — there is no employee record table (PII elsewhere lives only as unstructured text
+inside ingested documents), so a message like "update EMP001's phone number" previously just hit
+`pii.py`'s ordinary input block, with no path to actually accomplish the task.
+
+**Deliberately separate from the general chat/RAG flow** — a decision made explicitly, not a
+default: a user asking an ordinary question that happens to surface PII from a retrieved document
+(e.g. "who reported the Line 7 stoppage, what's their phone?") keeps its existing, deliberately-
+tested behavior (§11's v4 prompt fix — raw retrieved text reaches the LLM so it doesn't self-censor,
+redaction happens only on the output side) completely unchanged. Gating that path too was evaluated
+and rejected: it would revert a real, tested bug fix and rewrite
+`tests/test_chat_authorized_pii_grounding.py`'s 6 passing tests for no benefit — that path was never
+what "update an employee's phone number" actually means.
+
+**Flow**:
+
+```
+Chat message
+     │
+     ▼
+detect_employee_pii_intent()   services/guardrails/pii_intent.py — deterministic regex, no LLM
+     │                          (employee-ID token + action-verb category; requires_approval-free —
+     │                          this is intent detection, not the llm_rbac.yaml capability mechanism)
+     ├─ no match ──────────────▶ existing chat.py flow, completely unchanged (including the
+     │                           existing hard PII block, for a message with PII but no
+     │                           recognized employee-record intent)
+     ▼ match (read/retrieve/add/modify/store)
+role granted Permission.MANAGE_EMPLOYEE_PII (hr/admin/ceo)?
+     │
+     ├─ no ─────────────────────▶ falls through to existing input guardrail pipeline unchanged —
+     │                            an unauthorized role sees today's ordinary PII handling, not a
+     │                            new error shape that would reveal this capability exists
+     ▼ yes
+create_pii_approval_request()  services/employee_pii/service.py — masks via the SAME redact_pii()
+     │                          (services/guardrails/pii.py) every other rail uses, locates/creates
+     │                          a placeholder EmployeePIIRecordModel row, queues an
+     │                          ApprovalRequestModel (target_type="employee_pii") — same table
+     │                          project submission and document deletion already use
+     ▼
+chat.py returns "pending approval, request <id>" — NO run_agent() CALL AT ALL. The LLM is never
+invoked on this path, which is what makes "raw PII never reaches the LLM for this capability" a
+structural guarantee rather than a prompt-level trust assumption.
+     │
+     ▼
+Human decides — POST /approvals/{id}/decide (routers/approvals.py), widened so HR may decide
+  target_type="employee_pii" requests scoped to their own department (Admin/CEO stay unscoped,
+  matching how those two roles are already modeled everywhere else in this RBAC system — see
+  require_permission()'s "*" wildcard convention). Any other role still can't decide anything here.
+     │
+     ├─ rejected ──▶ a placeholder record (an "add" with nothing committed yet) is deleted;
+     │               an existing record is left untouched. Nothing was ever exposed.
+     ▼ approved
+apply_decision()  writes real values for add/modify/store (from an explicit `values` dict the
+                  decider supplies at decide-time — see below for why), or for read/retrieve,
+                  fetches the real value straight into `approval.payload["result"]`. Neither path
+                  ever routes through the LLM.
+```
+
+**Why the decider supplies `values` explicitly, rather than this auto-parsing a new field value out
+of the original message**: reliably mapping arbitrary phrasing ("set EMP001's phone to 555-0100")
+onto a specific structured field is genuinely fragile free-text parsing, and there's no existing
+recognizer in `pii_patterns.py` for some target fields at all (street address has none). A human
+reading the actual pending request (`payload.raw_message` — visible only to an authorized decider,
+never the general approvals list) and confirming the exact value to write is a more correct reading
+of "human approval" than a regex guess would be, not a shortcut. `payload.raw_message` is stored
+unencrypted, the same trust boundary as every other Postgres column in this app — flagged, not
+silently assumed fine.
+
+**RBAC scope, precisely**: `routers/approvals.py::_can_view_approval()`/`_hr_employee_pii_scope_ok()`
+— Admin/CEO unscoped for every target type; HR only for `target_type="employee_pii"` whose target
+record's `department` matches their own (or is unset, matching `retrieval_permissions.py`'s existing
+"no permission rows = unscoped" convention); the request's own original requester may always view
+(not decide) their own request, for any target type — a side benefit that also fixes a pre-existing
+gap where a PM could never check their own project-submission approval's status. `GET /approvals`
+(the list) never returns `payload` at all, and for an HR caller is pre-filtered to their own
+department's `employee_pii` rows — a list response can never reveal that an out-of-scope employee's
+PII request even exists, let alone its content.
+
+**Audit trail — no new mechanism**: the `ApprovalRequestModel` row itself (requester, approver,
+decision, timestamps, reason) plus its `payload` JSONB (PII type, action, purpose, `send_to_llm`
+[always `false` for this capability], `store_in_db`) is the record — same generic, already-existing
+table `docs/PROJECT_GOVERNANCE.md`'s approvals use, not a parallel audit system.
+`record_guardrail_event()` (`services/monitoring/metrics.py`, called by every other check in this
+document) fires at request-creation and at decision time, landing in the same admin-visible
+`GET /admin/guardrail-analytics` store as everything else, and the requester's own chat trace shows
+the same steps (`employee_pii_intent` → `employee_pii_mask` → `employee_pii_approval_requested`) —
+nothing about this flow is invisible to the person who triggered it.
+
+**What this does not do** — flagged explicitly: no push/resume for the original chat turn (no
+websocket/notification infra in this app — the requester checks `GET /approvals/{id}` once decided,
+rather than the original turn auto-completing); no field-level encryption at rest for pending values
+held in `payload` before a decision; no general CRUD UI for browsing/searching all employee records
+(this flow is entirely request-driven from a chat message, not a standalone HR admin panel).
+
+**New**: `app/models/employee_pii_record.py` (`EmployeePIIRecordModel` — `pending`/`active` status,
+the placeholder-until-approved pattern above), `services/guardrails/pii_intent.py`
+(`detect_employee_pii_intent()`), `services/employee_pii/service.py`
+(`create_pii_approval_request()`/`apply_decision()`), `Permission.MANAGE_EMPLOYEE_PII`
+(`core/permissions.py`, granted to hr/admin/ceo in `llm_rbac.yaml`), `frontend/app/views/approvals.py`
+(zero approvals UI existed anywhere before this).
+
+**Tests**: `tests/guardrails/test_pii_intent.py` (detection, table-driven, mirrors
+`test_destructive.py`'s style), `tests/test_employee_pii_approval.py` (request creation masks
+correctly, HR same-department allow / cross-department 403, Admin/CEO unscoped, rejected request
+never exposes a real value, `GET /approvals/{id}` requester-access widening doesn't leak other
+users' requests). `tests/test_chat_authorized_pii_grounding.py`'s 6 tests are the regression check
+that the general chat/RAG PII path really is untouched.
 
 **Tests**: `tests/guardrails/test_semantic_check.py` (8 — disabled no-op, close-paraphrase blocks,
 unrelated-safe passes, destructive paraphrase blocks, threshold configurability with a precisely

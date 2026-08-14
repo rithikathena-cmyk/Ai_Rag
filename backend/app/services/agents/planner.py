@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Literal, TypedDict
 
 import anthropic
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
@@ -27,7 +27,7 @@ from app.services.agents.retrieval_agent import search_documents
 from app.services.agents.sql_agent import SqlAgentError, run_analytics_query
 from app.services.retrieval.query_rewrite import rewrite_query
 
-PLANNER_PROMPT = load_prompt("planner_agent", "v3")
+PLANNER_PROMPT = load_prompt("planner_agent", "v5")
 PLANNER_SYSTEM_PROMPT = PLANNER_PROMPT.text
 
 INCOMPLETE_ANSWER = "I wasn't able to finish gathering everything needed to answer this within the allotted steps."
@@ -317,6 +317,49 @@ def _build_tools(
     return [all_tools[n] for n in names]
 
 
+def _run_floor_search(
+    query: str, all_sources: list[dict], citation_counter: itertools.count, trace: list[dict],
+    retrieved_doc_ids: list[str], tool_call_names: list[str], *, top_k: int | None, user_id: uuid.UUID | None,
+    role: str | None, knowledge_departments: tuple[str, ...] | None,
+) -> list:
+    """settings.deterministic_floor_search_enabled's implementation: runs one
+    search_documents call using `query` verbatim (the user's own message,
+    never an LLM-chosen paraphrase) and returns it as a synthetic
+    (AIMessage tool_call, ToolMessage result) pair — LangGraph/Anthropic's
+    standard shape for "the model already made this tool call and here's
+    what came back". Placed in the conversation before the agent's own first
+    real turn, so call_model()'s first LLM call already has this baseline
+    context available whether or not the agent decides to search again
+    itself. Mutates all_sources/trace/retrieved_doc_ids/tool_call_names
+    exactly like search_documents_tool (in _build_tools above) does, so
+    citations/audit logging/the UI trace read identically regardless of
+    whether a source came from this floor search or a real agent-issued
+    tool call."""
+    db = new_session()
+    try:
+        raw_results = search_documents(
+            db, query=query, top_k=top_k, user_id=user_id, role=role, knowledge_departments=knowledge_departments,
+        )
+    finally:
+        db.close()
+    tool_call_names.append("search_documents")
+    numbered = [{"index": next(citation_counter), **r} for r in raw_results]
+    all_sources.extend(_public_source_view(item) for item in numbered)
+    retrieved_doc_ids.extend(r["document_id"] for r in raw_results)
+    trace.append({
+        "agent": "Retrieval Agent",
+        "tool": "search_documents",
+        "input": query,
+        "summary": f"{len(numbered)} chunk(s) matched (deterministic floor search on your literal message)",
+    })
+    call_id = f"floor-search-{uuid.uuid4().hex[:8]}"
+    payload = json.dumps([_llm_source_view(item) for item in numbered], default=str)
+    return [
+        AIMessage(content="", tool_calls=[{"name": "search_documents", "args": {"query": query}, "id": call_id}]),
+        ToolMessage(content=payload, tool_call_id=call_id, name="search_documents"),
+    ]
+
+
 def _to_lc_message(m: dict):
     return HumanMessage(m["content"]) if m["role"] == "user" else AIMessage(m["content"])
 
@@ -454,7 +497,9 @@ def run_agent(
 
     tier = model_tier or ModelTier.FAST
     tier_config = model_router.resolve(tier)
-    model = claude_gateway.get_langchain_model(tier=tier, max_tokens=settings.agent_max_tokens).bind_tools(tools)
+    model = claude_gateway.get_langchain_model(
+        tier=tier, max_tokens=settings.agent_max_tokens, temperature=settings.agent_temperature
+    ).bind_tools(tools)
 
     def call_model(state: AgentState) -> dict:
         call_start = time.perf_counter()
@@ -507,7 +552,16 @@ def run_agent(
     workflow.add_edge("tools", "agent")
     graph = workflow.compile()
 
-    initial_state: AgentState = {"messages": [_to_lc_message(m) for m in (history or [])] + [HumanMessage(query)]}
+    floor_search_messages = []
+    if settings.deterministic_floor_search_enabled and (allowed_tools is None or "search_documents" in allowed_tools):
+        floor_search_messages = _run_floor_search(
+            query, all_sources, citation_counter, trace, retrieved_doc_ids, tool_call_names,
+            top_k=top_k, user_id=user_id, role=role, knowledge_departments=knowledge_departments,
+        )
+
+    initial_state: AgentState = {
+        "messages": [_to_lc_message(m) for m in (history or [])] + [HumanMessage(query)] + floor_search_messages
+    }
 
     try:
         final_state = graph.invoke(

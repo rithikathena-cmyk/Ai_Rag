@@ -1,3 +1,4 @@
+import time
 import uuid
 from typing import Literal
 
@@ -7,15 +8,21 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.errors import AppError
+from app.core.permissions import Permission
 from app.db.postgres import get_db
 from app.models.user import UserModel
 from app.gateway.claude_gateway import GenerationError
 from app.gateway.usage_tracker import record_denied
 from app.services.agents.planner import run_agent, run_retrieval_fallback
 from app.services.auth.dependencies import get_current_user
+from app.services.employee_pii.service import create_pii_approval_request
 from app.services.guardrails.citation_rail import NAME as CITATION_CHECK_NAME, check_citations, confidence_score
+from app.services.guardrails.escalation import check_escalation, record_block
+from app.services.guardrails.groundedness_check import NAME as GROUNDEDNESS_CHECK_NAME, check_groundedness
+from app.services.guardrails.pii_intent import detect_employee_pii_intent
 from app.services.guardrails.pipeline import run_input_guardrails, run_output_guardrails
 from app.services.guardrails.types import GuardrailStep
+from app.services.llm_rbac import policy_loader
 from app.services.llm_rbac.engine import authorize_llm_request
 from app.services.llm_rbac.report_policy import authorize_report
 from app.services.memory.preferences import get_preferences
@@ -110,10 +117,18 @@ class ChatResponse(BaseModel):
     # (which stays server-side, in the logger calls made where the
     # GenerationError was actually raised/classified).
     degraded_reason: str | None
+    # Total wall-clock time for this /chat call — RBAC gate, guardrails,
+    # retrieval, every Claude Gateway round-trip, everything — not just the
+    # model's own latency (that's already broken out per-call in
+    # gateway_usage_logs/GET /admin/gateway-usage). This is what a user
+    # actually experienced waiting for a reply, shown in the chat UI.
+    response_time_ms: float
 
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
+    _start = time.perf_counter()
+
     # LLM RBAC gate — the single entrypoint every user-role-driven Claude
     # request goes through before anything else runs (permission, rate
     # limit, quota). A denial here is itself an auditable event.
@@ -128,6 +143,15 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: User
             requested_capability=request.action,
         )
         raise
+
+    # Guardrail-block escalation gate — a user who has accumulated enough
+    # recent guardrail blocks (services/guardrails/escalation.py) is turned
+    # away here, before conversation lookup/creation or any guardrail check
+    # runs on this new message. Distinct from the RBAC gate above (that's
+    # about what this role is permitted to do; this is about a pattern of
+    # blocked messages regardless of role) and from rate_limiter.py (that's
+    # request volume; this is blocked-message frequency).
+    check_escalation(current_user.id)
 
     report_row_filter = None
     if request.report_type:
@@ -177,9 +201,58 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: User
     summary, history = build_context(db, conversation.id)
     preferences = get_preferences(db, current_user.id)
 
+    # Employee-PII approval gate — checked against the RAW message, before
+    # the general input guardrail pipeline below. A match here takes over
+    # the whole turn and returns immediately; run_agent() is never called on
+    # this path, which is what makes "raw PII never reaches the LLM for this
+    # capability" a structural guarantee rather than a prompt-level trust
+    # assumption (see services/guardrails/pii_intent.py's module docstring).
+    # A message that doesn't match falls through to run_input_guardrails()
+    # completely unchanged, including today's existing hard PII block — see
+    # docs/GUARDRAILS_ARCHITECTURE.md §14.
+    pii_intent = detect_employee_pii_intent(request.message)
+    if pii_intent is not None:
+        granted = policy_loader.role_config(current_user.role).granted_permissions
+        if Permission.MANAGE_EMPLOYEE_PII.value in granted or "*" in granted:
+            approval = create_pii_approval_request(db, current_user, pii_intent, request.message)
+            add_message(db, conversation.id, role="user", content=pii_intent.masked_text)
+            reply = f"This request requires approval — request {approval.id} is pending review."
+            add_message(db, conversation.id, role="assistant", content=reply)
+            trace = _guardrail_trace([
+                GuardrailStep(
+                    "employee_pii_intent", "block",
+                    f"Detected {pii_intent.action} request for employee {pii_intent.employee_id}",
+                ),
+                GuardrailStep(
+                    "employee_pii_mask", "redact",
+                    f"Masked PII types: {', '.join(pii_intent.pii_types) or 'none'}",
+                ),
+                GuardrailStep(
+                    "employee_pii_approval_requested", "block",
+                    f"Approval request {approval.id} created, pending review",
+                ),
+            ])
+            return ChatResponse(
+                conversation_id=conversation.id,
+                reply=reply,
+                sources=[],
+                report=None,
+                trace=trace,
+                confidence="n/a",
+                model_tier=decision.model_tier.value,
+                degraded=False,
+                degraded_reason=None,
+                response_time_ms=(time.perf_counter() - _start) * 1000,
+            )
+        # Role isn't granted MANAGE_EMPLOYEE_PII — fall through to the
+        # existing input guardrail pipeline unchanged, so an unauthorized
+        # role sees today's ordinary PII handling, not a new error shape
+        # that would reveal this capability exists.
+
     input_guardrails = run_input_guardrails(request.message) if settings.guardrails_enabled else None
 
     if input_guardrails and input_guardrails.blocked:
+        record_block(current_user.id)
         add_message(db, conversation.id, role="user", content=request.message)
         add_message(db, conversation.id, role="assistant", content=input_guardrails.block_reason)
         return ChatResponse(
@@ -192,9 +265,11 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: User
             model_tier=decision.model_tier.value,
             degraded=False,
             degraded_reason=None,
+            response_time_ms=(time.perf_counter() - _start) * 1000,
         )
 
     message = input_guardrails.text if input_guardrails else request.message
+
     add_message(db, conversation.id, role="user", content=message)
 
     degraded = False
@@ -226,15 +301,22 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: User
     output_guardrails = run_output_guardrails(result.reply) if settings.guardrails_enabled else None
     reply = output_guardrails.text if output_guardrails else result.reply
     blocked = bool(output_guardrails and output_guardrails.blocked)
-    if blocked:
+    if output_guardrails and output_guardrails.blocked:
+        record_block(current_user.id)
         reply = output_guardrails.block_reason
 
     # A blocked reply isn't a real grounded answer, so there's nothing
-    # meaningful to check citations against or score confidence for.
+    # meaningful to check citations/groundedness against or score confidence
+    # for.
     citation_step = (
         GuardrailStep(CITATION_CHECK_NAME, "pass", "Output blocked upstream; citation check skipped")
         if blocked
         else check_citations(reply, result.sources)
+    )
+    groundedness_step = (
+        GuardrailStep(GROUNDEDNESS_CHECK_NAME, "pass", "Output blocked upstream; groundedness check skipped")
+        if blocked
+        else check_groundedness(reply, result.sources)
     )
     confidence: Literal["high", "medium", "low", "n/a"] = "n/a" if blocked else confidence_score(result.sources)
 
@@ -244,10 +326,13 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: User
     except GenerationError:
         pass  # summarization is best-effort; never fail an otherwise-good response over it
 
+    # Trace order matches the actual flow: deterministic input guardrails ->
+    # planner/retrieval/LLM -> deterministic output guardrails -> citation ->
+    # groundedness.
     trace = (
         _guardrail_trace(input_guardrails.steps if input_guardrails else [])
         + [ChatTraceStep(**t) for t in result.trace]
-        + _guardrail_trace((output_guardrails.steps if output_guardrails else []) + [citation_step])
+        + _guardrail_trace((output_guardrails.steps if output_guardrails else []) + [citation_step, groundedness_step])
     )
 
     return ChatResponse(
@@ -260,4 +345,5 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: User
         model_tier=decision.model_tier.value,
         degraded=degraded,
         degraded_reason=result.degraded_reason,
+        response_time_ms=(time.perf_counter() - _start) * 1000,
     )

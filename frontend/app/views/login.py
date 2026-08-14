@@ -37,8 +37,8 @@ with center:
             st.success(f"Logged in as **{user.get('email', '?')}** — role: `{user.get('role', '?')}`")
             st.caption(f"User ID: `{user.get('id', '?')}`")
             col1, col2 = st.columns(2)
-            if col1.button("Go to Dashboard →", type="primary", use_container_width=True):
-                st.switch_page("views/dashboard.py")
+            if col1.button("Go to Chat →", type="primary", use_container_width=True):
+                st.switch_page("views/chat.py")
             if col2.button("Log out", use_container_width=True):
                 api_client.logout()
                 st.rerun()

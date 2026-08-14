@@ -80,7 +80,16 @@ class Settings(BaseSettings):
     classification_rule_confidence_threshold: float = 0.6
     classification_zero_shot_confidence_threshold: float = 0.5
 
-    parse_timeout_seconds: float = 120
+    # PyMuPDF has no OCR, so a scanned/image-only PDF yields near-zero
+    # extractable text; when parse_document() detects that (chars-per-page
+    # below this threshold), it re-parses the same PDF through Docling's OCR
+    # pipeline instead of leaving it as an unsearchable low-text document.
+    pdf_ocr_fallback_enabled: bool = True
+    pdf_ocr_fallback_min_chars_per_page: float = 20.0
+
+    # Raised from 120 to cover the OCR fallback above — CPU-only Docling OCR
+    # on a multi-page scanned PDF routinely takes well past 120s.
+    parse_timeout_seconds: float = 300
     chunk_timeout_seconds: float = 60
     embed_timeout_seconds: float = 300
 
@@ -137,6 +146,33 @@ class Settings(BaseSettings):
     chat_context_top_k: int = 5
 
     agent_max_tokens: int = 4096
+    # Anthropic's default sampling temperature is ~1.0 (fully stochastic).
+    # The planner loop (services/agents/planner.py::run_agent) reuses the
+    # SAME model instance for both deciding what to search for
+    # (search_documents' `query` tool argument) and the final synthesis, so
+    # both were previously exactly as variable as an unconstrained sampling
+    # draw — the same question could retrieve a different query phrasing,
+    # and the same retrieved context could be synthesized into "here's the
+    # answer" or "I don't see this in the corpus" on different runs. Lowered
+    # (not zeroed) to shrink that variance while still allowing natural
+    # phrasing in the synthesized reply — 0.0 (fully greedy) risks
+    # repetitive/degenerate output on longer syntheses. This only reduces
+    # variance; it is not itself a reliability floor — see
+    # deterministic_floor_search_enabled below for that.
+    #
+    # In practice this ONLY takes effect for tiers without extended thinking
+    # (currently haiku/Employee-role — see models.yaml's
+    # supports_extended_reasoning) — verified live that Anthropic's API
+    # rejects any non-1 temperature when thinking is enabled, which every
+    # other tier (sonnet/opus/reasoning/fast) uses by default, so
+    # gateway/claude_gateway.py::get_langchain_model() silently skips this
+    # setting for those tiers rather than sending a request that would 400.
+    # HR/PM/CEO/Admin's reliability instead relies entirely on
+    # deterministic_floor_search_enabled below, which has no such
+    # restriction and is the actual fix for retrieval recall regardless of
+    # tier — this setting is a secondary variance-reduction for the one tier
+    # where it's compatible, not the primary fix for any tier.
+    agent_temperature: float = 0.2
     # Raised from 4: a Haiku-tier (Employee-role) run chasing a named-but-absent
     # document through repeated near-duplicate search_documents calls hit this
     # limit (recursion_limit = iterations*2+1) before ever reaching a synthesis
@@ -145,6 +181,19 @@ class Settings(BaseSettings):
     # guidance (prompts/planner_agent_v3.yaml), which should make hitting this
     # ceiling rare regardless of headroom.
     agent_max_tool_iterations: int = 6
+    # A search_documents call using the user's own message verbatim as the
+    # query, that always runs once before the agent's own (LLM-chosen,
+    # sampled) tool calls — see docs/RAG_RETRIEVAL.md. Exists because every
+    # step of the agent's own retrieval decision (whether to search, what
+    # query text to use, when to give up per prompts/planner_agent_v3.yaml's
+    # "stop after two attempts" guidance) is itself LLM-sampled with no
+    # deterministic floor underneath it — a well-defined, on-topic document
+    # lookup shouldn't depend on how one particular sampling draw happened to
+    # phrase the search. The agent still sees these results as ordinary tool
+    # output (same citation/redaction path as a real search_documents call)
+    # and may search further/differently on top of them if it judges that
+    # necessary; this only guarantees a baseline never depends on phrasing.
+    deterministic_floor_search_enabled: bool = True
     sql_agent_row_limit: int = 500
 
     report_dir: str = str(_BACKEND_ROOT / "report_storage")
@@ -156,6 +205,12 @@ class Settings(BaseSettings):
 
     guardrails_enabled: bool = True
     guardrail_max_input_chars: int = 4000
+    guardrail_max_input_lines: int = 200
+    # 30+ of the exact same character in a row ("aaaa...", "!!!!...") — real
+    # prose essentially never does this; catches degenerate/DoS-shaped input
+    # a plain char-count cap wouldn't (a 3999-char message of "a" repeated
+    # passes the length cap but is still a garbage/abuse pattern).
+    guardrail_max_repeated_chars: int = 30
     guardrail_block_prompt_injection: bool = True
     guardrail_block_destructive_intent: bool = True
     guardrail_redact_pii: bool = True
@@ -185,14 +240,17 @@ class Settings(BaseSettings):
     # that point; redaction is what's left to do.
     guardrail_pii_block_input: bool = True
 
-    # LLM-based advanced guardrail check (docs/GUARDRAILS_ARCHITECTURE.md §10) —
-    # secrets only; enablement/model/timeout live in backend/config/guardrails.yaml
-    # (this repo's convention for genuinely-new rails, matching the retrieval
-    # and citation rails). Deliberately not the Claude Gateway: every call
-    # here would cost real Anthropic tokens on top of the planner/judge/
-    # rewrite calls that already use it. Gemini's free tier has a real $0
-    # quota for small models, so it's the default provider for this rail.
-    gemini_api_key: str = ""
+    # Employee-ID recognizer is opt-in and config-driven — there's no single
+    # correct shape ("EMP-12345" vs "EMP12345" vs an org-specific scheme
+    # entirely), so the recognizer stays off (None) until a deployment
+    # supplies its own pattern, rather than guessing at one convention.
+    guardrail_employee_id_pattern: str | None = None
+    # Bank-account detection is off by default — an 8-18 digit run is
+    # genuinely ambiguous (order id, reference code, phone number) without
+    # real context, and a keyword-anchored regex only partially addresses
+    # that (see pii_patterns.py's BANK_ACCOUNT_RE docstring). Enable only if
+    # the false-positive rate on your actual traffic is acceptable.
+    guardrail_bank_account_detection_enabled: bool = False
 
     fallback_retrieval_top_k: int = 3
     fallback_chunk_char_limit: int = 500
