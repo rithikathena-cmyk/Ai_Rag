@@ -106,10 +106,10 @@ class GuardrailsEngine:
 
     def _register_default_rails(self):
         """Register all guardrail rails"""
-        from app.services.guardrails.rails.pii import PIIRail
-        from app.services.guardrails.rails.injection import InjectionRail
-        from app.services.guardrails.rails.scope import ScopeRail
-        from app.services.guardrails.rails.policy import PolicyRail
+        from app.services.guardrails.rails.pii_rail import PIIRail
+        from app.services.guardrails.rails.injection_rail import InjectionRail
+        from app.services.guardrails.rails.scope_rail import ScopeRail
+        from app.services.guardrails.rails.policy_rail import PolicyRail
 
         self.register_rail("pii", PIIRail())
         self.register_rail("injection", InjectionRail())

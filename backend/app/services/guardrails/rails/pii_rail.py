@@ -137,6 +137,10 @@ class PIIRail(BaseRail):
         if surface == Surface.RETRIEVAL:
             return Verdict.REDACT
 
+        # Email: redact by default (not high-risk)
+        if pii_type == "email":
+            return Verdict.REDACT
+
         # Default: redact
         return Verdict.REDACT
 
