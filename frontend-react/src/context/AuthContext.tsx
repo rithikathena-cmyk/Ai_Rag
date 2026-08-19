@@ -51,7 +51,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     async function hydrate() {
       if (!tokenStorage.getAccess()) {
-        setStatus('anonymous')
+        // Auto-login as Employee demo user
+        try {
+          const tokens = await demoLoginRequest('Employee')
+          if (cancelled) return
+          tokenStorage.set(tokens.access_token, tokens.refresh_token, true)
+          const [me, caps] = await Promise.all([getCurrentUser(), getCapabilities()])
+          if (cancelled) return
+          setUser(me)
+          setCapabilities(caps)
+          setStatus('authenticated')
+        } catch {
+          if (cancelled) return
+          setStatus('anonymous')
+        }
         return
       }
       try {
