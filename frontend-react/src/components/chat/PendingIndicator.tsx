@@ -10,7 +10,7 @@ export function PendingIndicator() {
           />
         ))}
       </span>
-      ATHENA is thinking...
+      AI Guardrails is analyzing...
     </div>
   )
 }

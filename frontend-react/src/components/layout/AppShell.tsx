@@ -26,7 +26,7 @@ export function AppShell() {
           >
             <Menu className="h-5 w-5" />
           </button>
-          <span className="text-sm font-semibold text-ink">ATHENA AI</span>
+          <span className="text-sm font-semibold text-ink">AI Guardrails</span>
         </div>
         <main className="min-h-0 flex-1 overflow-y-auto">
           <Outlet />

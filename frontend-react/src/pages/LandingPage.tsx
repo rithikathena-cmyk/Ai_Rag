@@ -536,9 +536,9 @@ function TopNav() {
       <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3 sm:px-8 lg:px-12">
         <div className="flex items-center gap-2">
           <div className="flex h-7 w-7 items-center justify-center rounded-md bg-accent-600 text-sm font-semibold text-white">
-            A
+            G
           </div>
-          <span className="text-sm font-semibold text-ink">ATHENA</span>
+          <span className="text-sm font-semibold text-ink">AI Guardrails</span>
         </div>
         <nav className="hidden items-center gap-6 text-sm text-neutral-600 md:flex">
           <a href="#architecture" className="transition-colors hover:text-ink">

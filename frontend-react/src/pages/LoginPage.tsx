@@ -47,11 +47,11 @@ export function LoginPage() {
         <div className="w-full max-w-sm animate-fade-slide-up">
           <div className="mb-5 flex flex-col items-center gap-2 text-center">
             <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-accent-600 text-base font-semibold text-white transition-transform duration-300 hover:scale-105">
-              A
+              G
             </div>
             <div>
-              <h1 className="text-lg font-semibold text-ink">Sign in to ATHENA</h1>
-              <p className="mt-0.5 text-sm text-neutral-500">Your enterprise knowledge assistant</p>
+              <h1 className="text-lg font-semibold text-ink">Sign in to AI Guardrails</h1>
+              <p className="mt-0.5 text-sm text-neutral-500">Enterprise AI security & control</p>
             </div>
           </div>
 

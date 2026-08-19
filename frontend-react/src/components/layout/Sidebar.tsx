@@ -134,10 +134,10 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
       >
         <div className="flex h-14 shrink-0 items-center gap-2 px-3">
           <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent-600 text-sm font-semibold text-white">
-            A
+            G
           </div>
           <span className={cn('flex-1 truncate text-sm font-semibold text-ink', collapsed && 'md:hidden')}>
-            ATHENA <span className="font-normal text-neutral-400">AI</span>
+            AI <span className="font-normal text-neutral-400">Guardrails</span>
           </span>
           <button
             type="button"
