@@ -17,3 +17,5 @@ backend/scripts/seeded_users.xlsx
 .playwright-mcp/
 frontend/.streamlit/secrets.toml
 .cloudflared/
+.env.local
+.env.*.local

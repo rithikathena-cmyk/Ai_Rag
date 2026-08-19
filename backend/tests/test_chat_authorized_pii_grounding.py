@@ -46,6 +46,7 @@ from app.core.config import settings
 from app.db.postgres import get_db
 from app.gateway.schemas import ModelTier
 from app.routers import chat as chat_router
+from app.services.agents.router import AgentName, Intent, RoutingDecision
 from app.services.auth.dependencies import get_current_user
 
 RAW_PHONE = "312-555-0173"
@@ -70,6 +71,18 @@ def _make_app(monkeypatch, *, reply: str, sources: list[dict], role: str = "user
 
     app.dependency_overrides[get_db] = _fake_get_db
 
+    # This file asserts the BUILT-IN safe defaults (REDACT on output, hence
+    # "[REDACTED_PHONE]"), but resolve_pii_policy() reads the live policy
+    # store — so a real PHONE rule in the shared dev database, e.g. one an
+    # admin created saying "mask phone, show the last four digits", changes
+    # what this pipeline legitimately produces and fails a test about
+    # something else entirely. Emptying the store pins these assertions to
+    # the defaults they are actually about. See SF-10 in docs/
+    # SECURITY_FINDINGS.md for the broader coupling.
+    from app.services.guardrail_policy import store as policy_store
+
+    monkeypatch.setattr(policy_store, "get_all_policies", lambda category: [])
+
     # B: the caller is authorized — fake_decision represents an RBAC grant
     # already resolved for this role/department, same as every other
     # chat.py-level test in this suite. Department/category filtering
@@ -89,13 +102,25 @@ def _make_app(monkeypatch, *, reply: str, sources: list[dict], role: str = "user
     monkeypatch.setattr(chat_router, "build_context", lambda db, cid: (None, []))
     monkeypatch.setattr(chat_router, "get_preferences", lambda db, uid: {})
     monkeypatch.setattr(chat_router, "maybe_summarize", lambda *a, **k: None)
+    # Stubbed so this file's tests don't depend on a real (or real-looking)
+    # ANTHROPIC_API_KEY / network access — routing itself is out of scope
+    # here (see the module docstring's scope note; router behavior is
+    # covered by test_agent_router.py / test_chat_agent_routing.py).
+    monkeypatch.setattr(
+        chat_router, "route",
+        lambda *a, **k: RoutingDecision(
+            agent=AgentName.GENERAL_RAG, intent=Intent.GENERAL_CHAT, confidence=1.0, reason="test",
+        ),
+    )
+    monkeypatch.setattr(chat_router, "audit_logger", SimpleNamespace(log=lambda *a, **k: None))
 
     persisted = []
     monkeypatch.setattr(
         chat_router, "add_message",
-        lambda db, conv_id, *, role, content, sources=None, report=None: persisted.append(
-            {"role": role, "content": content, "sources": sources}
-        ),
+        lambda db, conv_id, *, role, content, sources=None, report=None, trace=None: (
+            persisted.append({"role": role, "content": content, "sources": sources}),
+            SimpleNamespace(id=uuid.uuid4()),
+        )[-1],
     )
 
     # C, as a controlled precondition (see module docstring): simulates
@@ -163,6 +188,9 @@ def test_e_final_response_contains_redacted_tokens_not_raw_values(monkeypatch):
     body = response.json()
     assert RAW_PHONE not in body["reply"]
     assert RAW_EMAIL not in body["reply"]
+    # PHONE/EMAIL's safe default output action is REDACT — a full opaque
+    # replacement, not a partial mask (see services/guardrail_policy/
+    # pii_policy.py's _SAFE_PII_DEFAULTS and pii.py's _resolve_match()).
     assert "[REDACTED_PHONE]" in body["reply"]
     assert "[REDACTED_EMAIL]" in body["reply"]
     # The point of this prompt change: redacted, not refused-into-uselessness.

@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -18,10 +19,44 @@ def make_document_dir(document_id: uuid.UUID) -> Path:
     return doc_dir
 
 
+def sanitize_filename(filename: str) -> str:
+    """Reduces a client-supplied filename to a single safe path segment.
+
+    `file.filename` on a multipart upload is attacker-controlled and, before
+    this, was joined into a filesystem path unsanitized (`doc_dir / "original"
+    / filename`) — a value like "../../../etc/passwd" or (on Windows) an
+    absolute path such as "C:\\Windows\\evil.dll" would escape `doc_dir`
+    entirely: `Path.__truediv__` does not normalize ".." segments, and joining
+    an absolute path onto an existing Path silently *discards* the left side
+    per pathlib's own documented behavior, so an absolute-looking filename
+    would have replaced the intended directory outright.
+
+    `Path(filename).name` strips every directory component (leading path,
+    drive letter, "..", "."), leaving only the final segment — no traversal
+    is possible with what's left. A handful of extra characters that are
+    illegal or dangerous on at least one target OS (NUL, control chars, the
+    Windows-reserved `<>:"|?*`) are stripped too, since this path may be read
+    back on a different OS than it was written on.
+    """
+    name = Path(filename.replace("\\", "/")).name
+    name = re.sub(r'[\x00-\x1f<>:"|?*]', "", name).strip(" .")
+    return name or "unnamed"
+
+
 def save_original(doc_dir: Path, filename: str, content: bytes) -> Path:
-    path = doc_dir / "original" / filename
-    path.write_bytes(content)
-    return path
+    safe_name = sanitize_filename(filename)
+    path = doc_dir / "original" / safe_name
+    # Belt-and-suspenders: confirm the resolved path is still actually inside
+    # doc_dir/original before writing anything — a second, independent check
+    # that doesn't rely solely on sanitize_filename() having covered every
+    # case, since a filesystem write is exactly the kind of consequence this
+    # guardrail's "fail closed" principle applies to.
+    target_dir = (doc_dir / "original").resolve()
+    resolved = path.resolve()
+    if resolved.parent != target_dir:
+        raise ValueError(f"Rejected unsafe upload filename: {filename!r}")
+    resolved.write_bytes(content)
+    return resolved
 
 
 def save_text(doc_dir: Path, text: str) -> Path:

@@ -73,7 +73,10 @@ def test_masked_text_never_contains_the_raw_pii_value():
     assert "123-45-6789" not in intent.masked_text
     assert "jane.doe@example.com" not in intent.masked_text
     assert "[REDACTED_SSN]" in intent.masked_text
-    assert "[REDACTED_EMAIL]" in intent.masked_text
+    # EMAIL is partially masked (guardrail_pii_mode="mask" by default — see
+    # pii.py's _mask_email): first 2 local-part chars, rest of the local
+    # part as '#', generic ".com" ending in place of the real domain.
+    assert "ja######.com" in intent.masked_text
     assert set(intent.pii_types) == {"SSN", "EMAIL"}
 
 
@@ -81,6 +84,21 @@ def test_employee_id_normalized_to_uppercase():
     intent = detect_employee_pii_intent("update emp001's phone number")
     assert intent is not None
     assert intent.employee_id == "EMP001"
+
+
+def test_masked_text_redacts_a_bare_local_format_phone_number():
+    """The approval workflow's masked_text is redact_pii()'s output (see
+    module docstring) — the NANP local-format phone fix (pii_validators.py)
+    must apply here too, not just the general chat pipeline. Previously
+    "555-0100" (no area code) was undetected and passed straight into
+    masked_text unredacted."""
+    intent = detect_employee_pii_intent("update EMP001's phone number to 555-0100")
+    assert intent is not None
+    assert "555-0100" not in intent.masked_text
+    # PHONE is partially masked (guardrail_pii_mode="mask" by default — see
+    # pii.py's _mask_phone): first 2 + last 1 digit visible, rest as '#'.
+    assert "55####0" in intent.masked_text
+    assert "PHONE" in intent.pii_types
 
 
 def test_action_precedence_modify_wins_over_read_verbs_in_same_message():

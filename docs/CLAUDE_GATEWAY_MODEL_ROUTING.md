@@ -6,18 +6,23 @@ RBAC adds on top of the existing tier mechanism. Nothing about the gateway's tie
 
 ## 1. Tiers
 
-`backend/config/models.yaml` now defines four tier keys, two real models:
+`backend/config/models.yaml` now defines four tier keys, two real models. **Opus is not used anywhere
+in this deployment** — `opus`/`reasoning` were repointed to Sonnet (from `claude-opus-5`) so no tier
+resolves to it; Sonnet is the ceiling model here.
 
 | Tier key | Model | Used by |
 |---|---|---|
-| `sonnet` | `claude-sonnet-5` | The only tier an Employee-role request can ever resolve to. Default tier for HR/PM. |
-| `opus` | `claude-opus-5` | HR/PM action-based escalation; CEO/Admin's default escalation target. |
-| `fast` | `claude-opus-5` | Unchanged — internal, non-role-driven callers (see §3). |
-| `reasoning` | `claude-opus-5` | Unchanged — reserved for a future caller that needs it, same as before this pass. |
+| `haiku` | `claude-haiku-4-5-20251001` | The only tier an Employee-role request can ever resolve to. |
+| `sonnet` | `claude-sonnet-5` | Default tier for HR/PM. |
+| `opus` | `claude-sonnet-5` | HR/PM action-based escalation; CEO/Admin's default escalation target. Same model as `sonnet` — the name is an RBAC permission tier, not a model promise. |
+| `fast` | `claude-haiku-4-5-20251001` | Internal, non-role-driven callers (see §3) — router classification, memory summarization, query rewrite, generation judge. |
+| `reasoning` | `claude-sonnet-5` | Reserved for a future caller that needs the ceiling tier. |
 
-`sonnet`/`opus` are not a rename of `fast`/`reasoning` — they're separate config keys pointing at
-different models today, kept distinct so the two vocabularies (capability tier vs. role-driven model
-choice) can diverge later without one accidentally assuming the other never will.
+`sonnet`/`opus` are not a rename of `fast`/`reasoning` — they're separate config keys, kept distinct so
+the two vocabularies (capability tier vs. role-driven model choice) can diverge later without one
+accidentally assuming the other never will. That distinction is also why swapping `fast` from Opus to
+Haiku (this pass) only touched `config/models.yaml`, not `llm_rbac.yaml` or any call site that names a
+tier — the tier names are stable; only what they resolve to changed.
 
 ## 2. Who picks the tier
 

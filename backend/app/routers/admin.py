@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 from typing import Literal
 
@@ -14,6 +15,8 @@ from app.db.postgres import get_db
 from app.db.qdrant import get_qdrant_client
 from app.gateway import availability
 from app.models.gateway_usage_log import GatewayUsageLogModel
+from app.models.user import UserModel
+from app.services.auth.dependencies import get_current_user
 from app.services.auth.rbac import require_permission
 from app.services.ingestion.consistency import check_all_documents
 from app.services.llm_rbac import policy_loader
@@ -232,6 +235,11 @@ def get_query_metrics():
 
 
 class GatewayUsageSample(BaseModel):
+    id: uuid.UUID
+    # NOT unique per row — one outer user request can make several Claude
+    # Gateway calls (planner turn, tool calls, judge, ...) that all share
+    # the same request_id for correlation. `id` above is this row's own
+    # primary key and the only field here safe to use as a unique React key.
     request_id: str
     agent_name: str
     model: str
@@ -240,6 +248,21 @@ class GatewayUsageSample(BaseModel):
     tokens_output: int
     latency_ms: float
     cost_usd: float
+    # LLM-RBAC audit fields (docs/AUDIT_LOGGING.md) — this table is the one
+    # durable "who did what, was it allowed" record the spec asks for (see
+    # GatewayUsageLogModel's own docstring), previously written but never
+    # read back through any endpoint. user_email is resolved server-side
+    # (batched, same convention as routers/approvals.py::_resolve_emails)
+    # so the frontend never needs a second lookup for a bare user_id.
+    user_id: uuid.UUID | None
+    user_email: str | None
+    role: str | None
+    department: str | None
+    decision: str
+    denial_reason: str | None
+    requested_capability: str | None
+    tool_calls: list[str] | None
+    documents_retrieved: list[str] | None
     created_at: datetime
 
 
@@ -258,25 +281,44 @@ class GatewayUsageResponse(BaseModel):
     samples: list[GatewayUsageSample]
     summary: list[GatewayUsageSummaryRow]
     total_cost_usd: float
+    # Counted over the FULL table (not just the returned sample window),
+    # same convention as total_cost_usd below — lets the UI show "how many
+    # requests were denied" without requiring every denial to fit in `limit`.
+    denied_count: int
 
 
 @router.get("/gateway-usage", response_model=GatewayUsageResponse, dependencies=_analytics)
-def get_gateway_usage(limit: int = 200, db: Session = Depends(get_db)):
+def get_gateway_usage(limit: int = 200, decision: str | None = None, db: Session = Depends(get_db)):
     """Claude Gateway call history: which agent called which model/tier, at
-    what cost. Summary is aggregated over the FULL table (not just the
-    returned sample window) since gateway_usage_logs is a real, unbounded
-    Postgres table, unlike the in-memory metrics below."""
-    rows = (
-        db.query(GatewayUsageLogModel)
-        .order_by(GatewayUsageLogModel.created_at.desc())
-        .limit(limit)
-        .all()
-    )
+    what cost — and, per GatewayUsageLogModel's own docstring, the durable
+    LLM-RBAC audit trail of who made each request, under what role/
+    department, whether it was allowed, and why not when it wasn't.
+    `decision` optionally filters to "allowed" or "denied" only. Summary is
+    aggregated over the FULL table (not just the returned sample window)
+    since gateway_usage_logs is a real, unbounded Postgres table, unlike the
+    in-memory metrics below."""
+    query = db.query(GatewayUsageLogModel)
+    if decision:
+        query = query.filter(GatewayUsageLogModel.decision == decision)
+    rows = query.order_by(GatewayUsageLogModel.created_at.desc()).limit(limit).all()
+
+    user_ids = {r.user_id for r in rows if r.user_id is not None}
+    emails = {}
+    if user_ids:
+        emails = {
+            row.id: row.email
+            for row in db.query(UserModel.id, UserModel.email).filter(UserModel.id.in_(user_ids)).all()
+        }
+
     samples = [
         GatewayUsageSample(
-            request_id=r.request_id, agent_name=r.agent_name, model=r.model, tier=r.tier,
+            id=r.id, request_id=r.request_id, agent_name=r.agent_name, model=r.model, tier=r.tier,
             tokens_input=r.tokens_input, tokens_output=r.tokens_output,
-            latency_ms=r.latency_ms, cost_usd=r.cost_usd, created_at=r.created_at,
+            latency_ms=r.latency_ms, cost_usd=r.cost_usd,
+            user_id=r.user_id, user_email=emails.get(r.user_id), role=r.role, department=r.department,
+            decision=r.decision, denial_reason=r.denial_reason, requested_capability=r.requested_capability,
+            tool_calls=r.tool_calls, documents_retrieved=r.documents_retrieved,
+            created_at=r.created_at,
         )
         for r in rows
     ]
@@ -306,7 +348,8 @@ def get_gateway_usage(limit: int = 200, db: Session = Depends(get_db)):
     summary.sort(key=lambda s: s.total_cost_usd, reverse=True)
 
     total_cost = db.query(func.sum(GatewayUsageLogModel.cost_usd)).scalar() or 0.0
-    return GatewayUsageResponse(samples=samples, summary=summary, total_cost_usd=total_cost)
+    denied_count = db.query(func.count(GatewayUsageLogModel.id)).filter(GatewayUsageLogModel.decision == "denied").scalar() or 0
+    return GatewayUsageResponse(samples=samples, summary=summary, total_cost_usd=total_cost, denied_count=denied_count)
 
 
 class GuardrailEventSample(BaseModel):
@@ -330,14 +373,38 @@ class GuardrailAnalyticsResponse(BaseModel):
     summary: list[GuardrailCheckSummary]
 
 
+# Placeholder swapped in for a guardrail event's raw detail when the caller
+# isn't cleared to see it (below). Deliberately says WHY the field is empty
+# rather than sending "" — a blank cell reads as "no detail was recorded,"
+# which would be false.
+_REDACTED_GUARDRAIL_DETAIL = "Details restricted"
+
+
 @router.get("/guardrail-analytics", response_model=GuardrailAnalyticsResponse, dependencies=_analytics)
-def get_guardrail_analytics():
+def get_guardrail_analytics(current_user: UserModel = Depends(get_current_user)):
     """Pass/redact/block counts per check (input: length/injection/destructive/
     scope/pii, output: system_prompt_leak/pii/output_citation_check), plus the
     raw recent event log — same in-memory store every guardrail step already
     writes to (services/monitoring/metrics.py::record_guardrail_event), just
-    not previously exposed through any endpoint."""
+    not previously exposed through any endpoint.
+
+    VIEW_ANALYTICS is now granted to every role (config/llm_rbac.yaml), so
+    this endpoint is reachable by ordinary Employees — but a step's raw
+    `detail` embeds classifier internals that the chat UI deliberately hides
+    from non-privileged users (semantic_check.py's "best score=0.52" and its
+    matched unsafe-example phrase, deberta_injection_check.py's "score=1.00",
+    scope.py's literal configured deny-keyword). Those are recorded here
+    verbatim by pipeline.py::_record(), so the same VIEW_AUDIT_LOGS line that
+    gates org-wide trace visibility (routers/traces.py) gates the raw detail
+    here — everyone still sees every event's direction/check/action and all
+    the pass/redact/block counts, which is what the dashboard is actually for.
+    """
+    granted = policy_loader.role_config(current_user.role).granted_permissions
+    may_see_raw_detail = Permission.VIEW_AUDIT_LOGS.value in granted or "*" in granted
+
     events = get_guardrail_events()
+    if not may_see_raw_detail:
+        events = [{**e, "detail": _REDACTED_GUARDRAIL_DETAIL} for e in events]
 
     by_check: dict[tuple[str, str], dict[str, int]] = {}
     for e in events:

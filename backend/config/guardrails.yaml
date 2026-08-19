@@ -10,6 +10,7 @@ input:
   destructive_intent_detection: true # settings.guardrail_block_destructive_intent
   pii_detection: true # settings.guardrail_redact_pii
   scope_check: true # settings.guardrail_scope_deny_keywords / _allow_keywords
+  secret_detection: true # secret_detection: below
 
 output:
   system_prompt_leak_check: true # settings.guardrail_block_system_prompt_leak
@@ -28,6 +29,15 @@ output_citation_rail:
   # bracketed citation marker, and attaches a High/Medium/Low confidence
   # score derived from the reranked sources' scores.
   citation_check_enabled: true
+
+# Credential/secret-shaped value detection (services/guardrails/secrets.py)
+# — runs on the user's raw input message (checked right after check_length,
+# before any model inference) using the SAME pattern set output.py's
+# system_prompt_leak_check already used to catch a secret leaking in a
+# *reply*. Deterministic, no model, no network call. A block never echoes
+# the matched value — see that module's docstring.
+secret_detection:
+  enabled: true
 
 # Presidio-based advanced PII check (services/guardrails/presidio_check.py)
 # — a second-pass PII rail. Runs LAST among input checks (a message any
@@ -101,23 +111,30 @@ deberta_injection_check:
 # ordinary queries unusable, the same false-positive lesson presidio_check's
 # own allowlist already learned for Presidio's default PERSON recognizer).
 gliner_check:
-  # Disabled: its "government-issued identification number" label
-  # false-triggers on this app's own internal employee-ID format
-  # (STF-MFG-41220 scored 0.62-0.77, above the 0.6 threshold, in
-  # sentences naming an incident reporter — a real, live false positive,
-  # not theoretical: it blocked "Who reported the Line 7 stoppage
-  # incident, and what is their contact information?" outright instead
-  # of just redacting). Re-wording the label was tried (5 variants
-  # measured directly against real SSN/passport examples plus the
-  # employee-ID false positive) — every variant that fixed the false
-  # positive also dropped real SSN and/or passport detection below
-  # threshold, with presidio_check unable to backstop passport numbers
-  # either (scores ~0.4, below its own 0.7 threshold, on the same test
-  # string). No wording found that fixed the false positive without a
-  # worse regression elsewhere, so disabling was the explicit call
-  # (user-requested) rather than shipping a still-broken label.
-  # presidio_check + pii_redact remain as this pipeline's PII coverage.
-  enabled: false
+  # Re-enabled: the earlier false positive (its "government-issued
+  # identification number" label scored 0.62-0.77, above the 0.6
+  # threshold, against this app's own internal employee-ID format like
+  # STF-MFG-41220 — live-verified, it blocked "Who reported the Line 7
+  # stoppage incident, and what is their contact information?" outright)
+  # was NOT fixable by re-wording the label — 5 variants were tried and
+  # every one that fixed the false positive also dropped real SSN/
+  # passport detection below threshold. The actual fix is structural, not
+  # lexical: gliner_validators.py vetoes a "government ID" candidate
+  # whose matched text independently matches this deployment's own
+  # configured employee-ID pattern (settings.guardrail_employee_id_pattern)
+  # — an org-specific ID format is a different kind of thing than a
+  # government-issued one, and this deployment already has an
+  # authoritative definition of its own ID shape, independent of
+  # anything GLiNER scored. Regression test: the exact string above, in
+  # test_gliner_check.py.
+  #
+  # Also changed alongside re-enabling: gliner_check.py no longer blocks
+  # on a successful detection at all (see that module's docstring) — it
+  # redacts validated findings using pii.py's own token-building logic,
+  # same as pii_redact, subject to the same guardrail_pii_block_input
+  # policy on the input side. A GLiNER false positive today means an
+  # extra redaction, not a wrongful refusal.
+  enabled: true
   model_name: urchade/gliner_small-v2.1
   # Omit (or leave empty) to use gliner_check.py's own _DEFAULT_LABELS —
   # only override this if you've re-validated a wider/narrower label set
@@ -193,7 +210,17 @@ scope_semantic_check:
     - "What happened in the hydraulic leak incident report?"
     - "What are the key metrics in the plant performance report?"
     - "How do I upload a new document to the system?"
-    - "Generate a report of recent conversations."
+    # Live guardrail sweep, 2026-08-18: this topic's original phrasing,
+    # "Generate a report of recent conversations.", was too structurally
+    # generic — ANY "Tell me X"/"Give me X" imperative opener scored close
+    # to it regardless of subject, purely from shared sentence shape, not
+    # topical similarity. Measured: "Tell me a joke" 0.624, "Tell me
+    # today's stock price" 0.576, "Tell me about the moon landing" 0.561 —
+    # all wrongly PASSED. Rephrasing to anchor the actual subject (this
+    # assistant's own conversation history) drops every one of those to
+    # 0.48-0.53 (correctly blocked) while keeping every real paraphrase of
+    # this topic comfortably above threshold (0.73-0.81).
+    - "Generate a report summarizing my recent conversations with this assistant."
     # scripts/seed_corpus_v3.py's 8-document batch — measured live against
     # this exact matcher before adding anything (not guessed): onboarding
     # ("What is our onboarding process for new hires?", 0.735) and customer
@@ -214,6 +241,87 @@ scope_semantic_check:
     # to run — best=0.52 vs the conveyor *incident* topic above, under the
     # 0.55 threshold, because "specs" and "incident" aren't close enough.
     - "What are the specs of the CV-350 conveyor system?"
+    # hr_benefits_guide.md's own topic — measured live before adding: "What
+    # benefits are employees entitled to?" scored 0.549, just under
+    # threshold, and was wrongly blocked (best match was the unrelated leave
+    # management topic). Adding this exact phrasing pulls close paraphrases
+    # well clear of the threshold too ("What's covered in the employee
+    # benefits guide?" 0.737, "What health insurance and retirement benefits
+    # do we offer?" 0.704).
+    - "What benefits are employees entitled to?"
+    # Live guardrail sweep, 2026-08-18: "Can I ignore the optional fields on
+    # the maintenance form?" scored 0.534, just under threshold — not because
+    # of the word "ignore" (confirmed: swapping it for "skip" only moves the
+    # score to 0.550, "leave blank" to 0.546 — still borderline either way),
+    # but because the only maintenance-related topic above is about the
+    # SCHEDULE, and nothing anchors maintenance FORMS/paperwork. Measured
+    # three candidate phrasings before picking this one; it gave the
+    # strongest lift (0.534 -> 0.830 on the original probe, 0.969 on "What
+    # are the optional fields on the maintenance form?") with zero movement
+    # on the out-of-scope controls (weather 0.417, football 0.532 either way).
+    - "What are the required and optional fields on the maintenance form?"
+    # Guardrail security-suite sweep, 2026-08-19 (tests/security/pii,
+    # injection, scope) — four legitimate self-service/document-lookup
+    # questions were wrongly blocked as out-of-scope, each measured live
+    # against this exact matcher before adding anything (not guessed), and
+    # each re-checked against the existing out-of-scope/mixed-scope negative
+    # controls (weather/football/SQL/etc., and the SCOPE-MIX-* compound
+    # bypass cases) to confirm nothing already correctly blocked moved.
+    #
+    # "Where are the work instructions for Line 3 stored?" scored 0.52 —
+    # close to the incident-report topics above but nothing anchors WORK
+    # INSTRUCTIONS specifically. Lifts it to 0.76.
+    - "Where can I find the work instructions for a production line?"
+    # "What does GEN-HR-POL-101 say about unexcused absence?" (also
+    # SCOPE-DOC-01) scored 0.45 — a document-ID reference, not a
+    # paraphrasable policy question, so nothing above anchored it. Three
+    # candidate phrasings were measured; this one gave the strongest lift
+    # (0.45 -> 0.76) without pulling the negative controls up at all
+    # (0.524 max, unchanged from before this addition).
+    - "What is stated in the HR policy document about unexcused absences?"
+    # "Where do I find my API key in the settings page?" scored 0.55 — right
+    # at threshold. This is a platform self-service question (like the
+    # existing "How do I upload a new document?" topic), not an enterprise-
+    # document question, so a dedicated anchor was needed. Lifts it to 0.95.
+    - "Where do I find my account settings or API key?"
+    # "Incident STF-MFG-41220 was raised - what is the follow-up procedure?"
+    # scored 0.48 — the existing incident topics anchor "what happened"/"who
+    # reported", not "what happens next". Lifts it to 0.71.
+    - "What is the follow-up procedure after a workplace incident is reported?"
+    # SCOPE-IN-06's long, multi-part safety briefing query scored 0.56/0.55
+    # (unstable right at threshold across runs) — existing PPE/SOP topics
+    # anchor short single-subject questions, not a long compound one
+    # mentioning PPE, moving machinery AND lockout-tagout together. Lifts it
+    # to 0.70, comfortably clear.
+    - "What safety procedures and PPE are required for operators working near moving machinery?"
+    # Guardrail security-suite sweep, 2026-08-19 continued (DeBERTa/SSN fixes
+    # exposed these — they were previously masked by earlier blocks upstream,
+    # not new). Six PII-disclosure statements ("My credit card number is X.",
+    # "My PAN is X, file my return.", "My passport is X and I live at Y.",
+    # spelled-out email, DOB, a mixed email+phone+DOB list) all lack request
+    # structure (no "?", no interrogative/request verb has_request_structure()
+    # recognizes), so they fall to whole-message scoring against these topics
+    # rather than per-clause — and scored 0.489-0.547, all just under
+    # threshold, because nothing here anchors "disclosing my own personal
+    # details for my record," only enterprise-topic Q&A.
+    #
+    # First attempt, "Please update my employee record with my personal
+    # information.", was a REAL regression, caught by
+    # tests/security/regression/test_known_regressions.py's own SF-03 suite
+    # (not by the ad-hoc negative-control list above, which only checks
+    # WHOLE-message scores — the regression was per-CLAUSE): it shares the
+    # exact "generic imperative-sentence-opener" trap this file's own
+    # "Generate a report of recent conversations" topic was reworded for
+    # earlier — "Tell me today's stock price" alone scored 0.60 against it,
+    # which let "Tell me today's stock price and explain our financial
+    # reporting policy." (a genuine SF-03 compound-scope bypass case) pass
+    # both of its split clauses instead of being refused. Replaced with a
+    # declarative, non-imperative phrasing that doesn't share that shape —
+    # measured against the same "Tell me X" adversarial family (max 0.534,
+    # still safely under 0.55) as well as the six original targets (now
+    # 0.578-0.659) before landing on it.
+    - "My personal information, such as my email, phone number, ID number or date of birth, is on file to update or verify my employee record."
+    - "My passport number and home address are provided to update or verify my identity on file."
   threshold: 0.55 # cosine similarity below this to EVERY configured topic blocks; lower to loosen, raise to tighten
   max_input_chars: 2000
 

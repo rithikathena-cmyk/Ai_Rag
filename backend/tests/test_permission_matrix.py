@@ -20,6 +20,7 @@ from app.core.permissions import Permission
 from app.core.roles import Role
 from app.routers import admin, conversations, evaluation, upload_logs, users
 from app.services.auth.dependencies import get_current_user
+from app.services.monitoring.metrics import record_guardrail_event
 
 
 def _bound_permissions(dependency) -> set:
@@ -88,11 +89,11 @@ def test_upload_logs_router_requires_view_audit_logs_permission():
 
 # ----------------------------------------------------------------- evaluation
 
-def test_evaluation_router_is_admin_or_ceo_only():
+def test_evaluation_router_is_admin_ceo_or_project_manager_only():
     roles = set()
     for dep in evaluation.router.dependencies:
         roles |= _bound_roles(dep.dependency)
-    assert roles == {Role.ADMIN, Role.CEO}
+    assert roles == {Role.ADMIN, Role.CEO, Role.PROJECT_MANAGER}
 
 
 # ---------------------------------------------------------------------- admin
@@ -119,6 +120,44 @@ def test_admin_analytics_routes_require_view_analytics():
         for dep in route.dependencies:
             perms |= _bound_permissions(dep.dependency)
         assert Permission.VIEW_ANALYTICS in perms, f"{method} {path}"
+
+
+# VIEW_ANALYTICS is granted to EVERY role (config/llm_rbac.yaml) so the
+# read-only Metrics dashboards are visible org-wide. The two tests below are
+# what keep that from also widening the one genuinely sensitive field behind
+# them: a guardrail event's raw `detail`, recorded verbatim by
+# pipeline.py::_record() and embedding classifier internals (semantic_check's
+# "best score=", its matched unsafe-example phrase, scope.py's configured
+# deny-keyword) that the chat UI deliberately hides from non-privileged users.
+
+class _StubUser:
+    def __init__(self, role: str):
+        self.role = role
+
+
+_SENSITIVE_DETAIL = "Semantically similar (score=0.91) to a known unsafe pattern: 'internal example phrase'"
+
+
+def _detail_for_role(role: str) -> str:
+    record_guardrail_event("input", "semantic_risk_check", "block", _SENSITIVE_DETAIL)
+    response = admin.get_guardrail_analytics(current_user=_StubUser(role))
+    return response.events[-1].detail
+
+
+def test_employee_cannot_see_raw_guardrail_detail():
+    # Employee holds VIEW_ANALYTICS (so the endpoint is reachable) but not
+    # VIEW_AUDIT_LOGS — the score and the matched internal phrase must not
+    # survive into the response at all, not merely be hidden client-side.
+    detail = _detail_for_role("user")
+    assert detail == admin._REDACTED_GUARDRAIL_DETAIL
+    assert "0.91" not in detail
+    assert "internal example phrase" not in detail
+
+
+def test_audit_log_roles_still_see_raw_guardrail_detail():
+    # Admin holds VIEW_AUDIT_LOGS, the same line that gates org-wide trace
+    # visibility — raw detail is intentionally unchanged for them.
+    assert _detail_for_role("admin") == _SENSITIVE_DETAIL
 
 
 # -------------------------------------------------------------------- users

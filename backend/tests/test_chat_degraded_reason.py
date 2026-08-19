@@ -28,6 +28,7 @@ from app.db.postgres import get_db
 from app.gateway.claude_gateway import GenerationError
 from app.gateway.schemas import GenerationErrorReason, ModelTier
 from app.routers import chat as chat_router
+from app.services.agents.router import AgentName, Intent, RoutingDecision
 from app.services.auth.dependencies import get_current_user
 
 
@@ -58,8 +59,19 @@ def _make_app(monkeypatch, *, run_agent_error: GenerationError | None = None, se
     monkeypatch.setattr(chat_router, "create_conversation", lambda db, user_id: _FakeConversation())
     monkeypatch.setattr(chat_router, "build_context", lambda db, cid: (None, []))
     monkeypatch.setattr(chat_router, "get_preferences", lambda db, uid: {})
-    monkeypatch.setattr(chat_router, "add_message", lambda *a, **k: None)
+    monkeypatch.setattr(chat_router, "add_message", lambda *a, **k: SimpleNamespace(id=uuid.uuid4()))
     monkeypatch.setattr(chat_router, "maybe_summarize", lambda *a, **k: None)
+    # Stubbed so this file's tests don't depend on a real (or real-looking)
+    # ANTHROPIC_API_KEY / network access — out of scope for the
+    # degraded-response logic under test here, see test_agent_router.py /
+    # test_chat_agent_routing.py for router behavior itself.
+    monkeypatch.setattr(
+        chat_router, "route",
+        lambda *a, **k: RoutingDecision(
+            agent=AgentName.GENERAL_RAG, intent=Intent.GENERAL_CHAT, confidence=1.0, reason="test",
+        ),
+    )
+    monkeypatch.setattr(chat_router, "audit_logger", SimpleNamespace(log=lambda *a, **k: None))
 
     if run_agent_error is not None:
         def _raise(*a, **k):
@@ -166,7 +178,18 @@ def test_input_guardrail_block_returns_a_valid_response_not_a_500(monkeypatch):
     SAME check (pii_redact) it always has — gliner_check's broader semantic
     label set ("government identification number") would otherwise
     correctly, but disruptively for this specific assertion, catch the SSN
-    first via a different check than the one this regression test is about."""
+    first via a different check than the one this regression test is about.
+
+    guardrail_pii_block_input is pinned True for the same reason
+    guardrails_enabled is: this app's real .env sets it False (redact input
+    PII and continue, rather than block — see that setting's own comment in
+    .env.example), which made this test flaky against ambient config — with
+    it False, pii_redact only *redacts* rather than blocking, so nothing
+    here would stop the message from falling through to
+    scope_semantic_check's generic deferred block instead of the specific
+    PII one this test is actually about. Pinning it, like guardrails_enabled,
+    makes the test's outcome depend only on the code under test, not on
+    whatever a deployment's .env happens to have set."""
     from app.services.guardrails import deberta_injection_check, gliner_check
 
     monkeypatch.setattr(
@@ -175,11 +198,13 @@ def test_input_guardrail_block_returns_a_valid_response_not_a_500(monkeypatch):
     monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": {"enabled": False}})
 
     settings.guardrails_enabled = True
+    settings.guardrail_pii_block_input = True
     try:
         client = _make_app(monkeypatch)
         response = client.post("/chat", json={"message": "My SSN is 123-45-6789, can you update my HR record?"})
     finally:
         settings.guardrails_enabled = False
+        settings.guardrail_pii_block_input = False
 
     assert response.status_code == 200, response.text
     body = response.json()

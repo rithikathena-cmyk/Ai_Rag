@@ -62,8 +62,11 @@ def add_message(
     content: str,
     sources: list[dict] | None = None,
     report: dict | None = None,
+    trace: list[dict] | None = None,
 ) -> MessageModel:
-    msg = MessageModel(conversation_id=conversation_id, role=role, content=content, sources=sources, report=report)
+    msg = MessageModel(
+        conversation_id=conversation_id, role=role, content=content, sources=sources, report=report, trace=trace,
+    )
     db.add(msg)
 
     convo = db.get(ConversationModel, conversation_id)

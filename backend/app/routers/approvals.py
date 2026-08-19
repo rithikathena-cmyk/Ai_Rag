@@ -18,6 +18,7 @@ from app.routers.documents import delete_document_row
 from app.services.auth.dependencies import get_current_user
 from app.services.auth.rbac import require_role
 from app.services.employee_pii import service as employee_pii_service
+from app.services.guardrail_policy import service as guardrail_policy_service
 from app.services.projects import service as projects_service
 
 router = APIRouter()
@@ -211,6 +212,8 @@ def decide_approval(
         # A rejected delete request just leaves the document untouched.
     elif approval.target_type == "employee_pii":
         employee_pii_service.apply_decision(db, approval, body.decision, current_user, body.values)
+    elif approval.target_type == "guardrail_policy":
+        guardrail_policy_service.apply_decision(db, approval, body.decision, current_user, body.values)
     else:
         raise AppError(422, "unsupported_target_type", f"No handler for target_type={approval.target_type!r}")
 

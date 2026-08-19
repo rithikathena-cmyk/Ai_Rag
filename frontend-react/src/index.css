@@ -1,0 +1,308 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --color-accent-50: #fbf3ef;
+  --color-accent-100: #f6e2d8;
+  --color-accent-200: #edc3af;
+  --color-accent-300: #e4a386;
+  --color-accent-400: #de8c6b;
+  --color-accent-500: #d97757;
+  --color-accent-600: #c15f3f;
+  --color-accent-700: #a14b32;
+  --color-accent-800: #7f3c29;
+  --color-accent-900: #663120;
+
+  --color-cream: #f7f5f2;
+  --color-cream-dark: #efede8;
+  --color-ink: #242322;
+
+  /* Raised-surface token (cards, modals, dropdowns, the sidebar's inputs) —
+     literal white in light mode, but MUST stay theme-aware, unlike
+     Tailwind's built-in `white` (kept literal on purpose: white text on a
+     solid accent-600 button needs to stay white in both themes). Anywhere
+     that used to reach for `bg-white` as "the panel color" should use
+     `bg-surface` instead so it repaints correctly under dark mode. */
+  --color-surface: #ffffff;
+
+  /* Warm neutral ramp — Tailwind's own neutral-* scale, redefined here so
+     every existing `text-neutral-500` / `border-neutral-200` / etc. across
+     the app repaints correctly under dark mode with zero per-component
+     changes (see the dark-mode override of the same variables below). */
+  --color-neutral-50: #fafaf9;
+  --color-neutral-100: #f5f4f2;
+  --color-neutral-200: #e7e5e1;
+  --color-neutral-300: #d3d0ca;
+  --color-neutral-400: #a8a29a;
+  --color-neutral-500: #78736b;
+  --color-neutral-600: #57534b;
+  --color-neutral-700: #44403a;
+  --color-neutral-800: #2b2926;
+  --color-neutral-900: #1c1a18;
+  --color-neutral-950: #121110;
+}
+
+:root {
+  color-scheme: light;
+}
+
+/* OS-level dark preference — applies only when the user hasn't made an
+   explicit in-app choice (no [data-theme] attribute stamped yet). */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --color-cream: #17140f;
+    --color-cream-dark: #1e1a14;
+    --color-ink: #ece6da;
+    --color-surface: #221e17;
+
+    --color-neutral-50: #221e17;
+    --color-neutral-100: #29241c;
+    --color-neutral-200: #383226;
+    --color-neutral-300: #4a4232;
+    --color-neutral-400: #6b6250;
+    --color-neutral-500: #8c8271;
+    --color-neutral-600: #a89e8b;
+    --color-neutral-700: #c2b9a8;
+    --color-neutral-800: #ded6c4;
+    --color-neutral-900: #ece6da;
+    --color-neutral-950: #f5f1e8;
+  }
+}
+
+/* Explicit in-app toggle — wins in both directions regardless of OS setting. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-cream: #17140f;
+  --color-cream-dark: #1e1a14;
+  --color-ink: #ece6da;
+  --color-surface: #221e17;
+
+  --color-neutral-50: #221e17;
+  --color-neutral-100: #29241c;
+  --color-neutral-200: #383226;
+  --color-neutral-300: #4a4232;
+  --color-neutral-400: #6b6250;
+  --color-neutral-500: #8c8271;
+  --color-neutral-600: #a89e8b;
+  --color-neutral-700: #c2b9a8;
+  --color-neutral-800: #ded6c4;
+  --color-neutral-900: #ece6da;
+  --color-neutral-950: #f5f1e8;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-cream text-ink antialiased;
+  transition: background-color 0.15s ease-out, color 0.15s ease-out;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-neutral-300 rounded-full;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes fade-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes shake {
+  10%,
+  90% {
+    transform: translateX(-1px);
+  }
+  20%,
+  80% {
+    transform: translateX(2px);
+  }
+  30%,
+  50%,
+  70% {
+    transform: translateX(-4px);
+  }
+  40%,
+  60% {
+    transform: translateX(4px);
+  }
+}
+
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes bounce-dot {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.5;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Login page hero panel's ambient background orbs — slow, subtle drift. */
+@keyframes float-slow {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  50% {
+    transform: translate(-3%, 4%);
+  }
+}
+
+.animate-fade-slide-up {
+  animation: fade-slide-up 0.35s ease-out both;
+}
+
+.animate-slide-in-right {
+  animation: slide-in-right 0.25s ease-out both;
+}
+
+.animate-shake {
+  animation: shake 0.4s ease-in-out;
+}
+
+.animate-bounce-dot {
+  animation: bounce-dot 1.1s ease-in-out infinite;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out both;
+}
+
+.animate-float-slow {
+  animation: float-slow 14s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-slide-up,
+  .animate-slide-in-right,
+  .animate-shake,
+  .animate-bounce-dot,
+  .animate-fade-in,
+  .animate-float-slow {
+    animation: none;
+  }
+}
+
+/* Document-style assistant response typography — comfortable for long
+   reading sessions (spec target: 15-17px body, generous line-height). */
+.prose-chat {
+  --tw-prose-body: var(--color-ink);
+  --tw-prose-headings: var(--color-ink);
+  --tw-prose-links: var(--color-accent-700);
+  --tw-prose-bold: var(--color-ink);
+  --tw-prose-code: var(--color-ink);
+  --tw-prose-quotes: var(--color-neutral-600);
+  --tw-prose-quote-borders: var(--color-neutral-300);
+  --tw-prose-th-borders: var(--color-neutral-200);
+  --tw-prose-td-borders: var(--color-neutral-200);
+  font-size: 0.9375rem;
+  line-height: 1.7;
+}
+
+.prose-chat :first-child {
+  margin-top: 0;
+}
+
+.prose-chat :last-child {
+  margin-bottom: 0;
+}
+
+.prose-chat h1,
+.prose-chat h2,
+.prose-chat h3 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.prose-chat pre {
+  background-color: var(--color-neutral-900);
+  border-radius: 0.75rem;
+}
+
+.prose-chat :not(pre) > code {
+  background-color: var(--color-neutral-100);
+  border-radius: 0.3rem;
+  padding: 0.125rem 0.4rem;
+  font-weight: 400;
+}
+
+.prose-chat :not(pre) > code::before,
+.prose-chat :not(pre) > code::after {
+  content: '';
+}
+
+/* Inline citation markers ([1], [2], ...) — rendered as small superscript-
+   style tags by components/chat/Markdown.tsx wrapping each match in
+   <sup class="citation-marker">. */
+.citation-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.1em;
+  height: 1.1em;
+  padding: 0 0.3em;
+  margin-left: 0.15em;
+  border-radius: 999px;
+  background-color: var(--color-accent-100);
+  color: var(--color-accent-800);
+  font-size: 0.7em;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-decoration: none;
+  vertical-align: super;
+  cursor: pointer;
+  transition: background-color 0.15s ease-out;
+}
+
+.citation-marker:hover {
+  background-color: var(--color-accent-200);
+}

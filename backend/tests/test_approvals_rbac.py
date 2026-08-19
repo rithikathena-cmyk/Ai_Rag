@@ -57,8 +57,13 @@ class _FakeSession:
             return self._project if self._project and id_ == self._project.id else None
         return None
 
-    def query(self, model):
-        if model is ApprovalRequestModel and self._approval is not None:
+    def query(self, model, *more):
+        # *more: routers/approvals.py's _resolve_emails() does a
+        # multi-column db.query(UserModel.id, UserModel.email) select — this
+        # fixture has no user rows to resolve emails for regardless, so
+        # every multi-column call is safe to fall through to the same empty
+        # result the single-column "unknown model" case already returns.
+        if not more and model is ApprovalRequestModel and self._approval is not None:
             return _FakeQuery([self._approval])
         return _FakeQuery([])
 
@@ -73,7 +78,7 @@ def _build_app(approval, project, role: str):
     app = FastAPI()
     app.include_router(approvals.router)
     app.dependency_overrides[get_db] = lambda: _FakeSession(approval, project)
-    fake_user = SimpleNamespace(id=uuid.uuid4(), role=role, department=None, is_active=True)
+    fake_user = SimpleNamespace(id=uuid.uuid4(), role=role, department=None, is_active=True, email="test-user@example.com")
     app.dependency_overrides[get_current_user] = lambda: fake_user
     return app
 
@@ -151,7 +156,7 @@ def test_admin_approving_a_document_delete_request_deletes_it(monkeypatch):
     app.include_router(approvals.router)
     fake_db = _FakeDocumentSession(approval, document)
     app.dependency_overrides[get_db] = lambda: fake_db
-    fake_user = SimpleNamespace(id=uuid.uuid4(), role=Role.ADMIN.value, department=None, is_active=True)
+    fake_user = SimpleNamespace(id=uuid.uuid4(), role=Role.ADMIN.value, department=None, is_active=True, email="admin@example.com")
     app.dependency_overrides[get_current_user] = lambda: fake_user
     client = TestClient(app)
 
@@ -171,7 +176,7 @@ def test_admin_rejecting_a_document_delete_request_leaves_it_untouched(monkeypat
     app.include_router(approvals.router)
     fake_db = _FakeDocumentSession(approval, document)
     app.dependency_overrides[get_db] = lambda: fake_db
-    fake_user = SimpleNamespace(id=uuid.uuid4(), role=Role.ADMIN.value, department=None, is_active=True)
+    fake_user = SimpleNamespace(id=uuid.uuid4(), role=Role.ADMIN.value, department=None, is_active=True, email="admin@example.com")
     app.dependency_overrides[get_current_user] = lambda: fake_user
     client = TestClient(app)
 

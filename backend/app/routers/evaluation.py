@@ -18,9 +18,12 @@ from app.services.evaluation.runner import EvaluationRetrievalError, run_evaluat
 # cost-heavy experiment-gate runner (real LLM calls across the whole eval
 # set). Gated by role rather than a coarse permission — this is a
 # cost-sensitive operational tool (retrieval quality testing), not general
-# analytics viewing, so it stays Admin/CEO-only regardless of who else has
-# VIEW_ANALYTICS.
-router = APIRouter(prefix="/eval", tags=["evaluation"], dependencies=[Depends(require_role(Role.ADMIN, Role.CEO))])
+# analytics viewing, so it stays limited to Admin/CEO/Project Manager
+# regardless of who else has VIEW_ANALYTICS (e.g. HR).
+router = APIRouter(
+    prefix="/eval", tags=["evaluation"],
+    dependencies=[Depends(require_role(Role.ADMIN, Role.CEO, Role.PROJECT_MANAGER))],
+)
 
 
 class EvalQueryCreateRequest(BaseModel):

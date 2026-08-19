@@ -78,6 +78,8 @@ def ensure_schema() -> None:
     import app.models.project_member  # noqa: F401  (registers ProjectMemberModel on Base.metadata)
     import app.models.approval_request  # noqa: F401  (registers ApprovalRequestModel on Base.metadata)
     import app.models.employee_pii_record  # noqa: F401  (registers EmployeePIIRecordModel on Base.metadata)
+    import app.models.audit_event  # noqa: F401  (registers AuditEventModel on Base.metadata)
+    import app.models.guardrail_policy  # noqa: F401  (registers GuardrailPolicyModel/GuardrailPolicyVersionModel on Base.metadata)
 
     Base.metadata.create_all(bind=get_engine())
     _run_light_migrations()
@@ -162,6 +164,18 @@ def _run_light_migrations() -> None:
         # "use the role default", see services/llm_rbac/engine.py.
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_token_limit_override INTEGER",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_token_limit_override INTEGER",
+        # Chat UI redesign — conversation pinning (routers/conversations.py
+        # PATCH /conversations/{id}); non-null = pinned.
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ",
+        # GLiNER PII layer — document-ingestion PII visibility metadata (see
+        # models/document.py::DocumentModel, routers/documents.py's
+        # upload_document()). Label names only, never matched spans.
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS contains_pii BOOLEAN NOT NULL DEFAULT false",
+        "ALTER TABLE documents ADD COLUMN IF NOT EXISTS pii_types JSONB",
+        # User-facing Security & Activity panel — persists the assistant
+        # reply's safe execution trace so it survives a conversation reload
+        # (models/message.py::MessageModel.trace).
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS trace JSONB",
     ]
     with get_engine().begin() as conn:
         for stmt in statements:

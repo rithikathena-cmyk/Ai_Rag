@@ -68,7 +68,9 @@ def _stub_infra(monkeypatch):
     # Isolates this test to department (category) filtering specifically —
     # per-user document grants are filter_by_permission's own concern,
     # already covered by tests/guardrails/test_retrieval_permissions.py.
-    monkeypatch.setattr("app.services.retrieval.metadata_filter.filter_by_permission", lambda db, ids, user_id: ids)
+    monkeypatch.setattr(
+        "app.services.retrieval.metadata_filter.filter_by_permission", lambda db, ids, user_id, role=None: ids
+    )
 
 
 def test_employee_search_never_includes_an_hr_department_document(monkeypatch):

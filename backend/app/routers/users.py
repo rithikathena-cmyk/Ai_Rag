@@ -9,10 +9,13 @@ from app.core.errors import AppError
 from app.core.permissions import Permission
 from app.core.roles import ROLE_VALUES, Role
 from app.db.postgres import get_db
+from app.models.document import DocumentModel
 from app.models.user import UserModel
 from app.services.auth.dependencies import get_current_user
 from app.services.auth.password import hash_password
 from app.services.auth.rbac import require_permission, require_role
+from app.services.guardrails.retrieval_permissions import filter_by_category, filter_by_permission
+from app.services.llm_rbac import policy_loader
 from app.services.llm_rbac.policy_loader import departments as llm_rbac_departments, role_config
 from app.services.llm_rbac.quotas import effective_quotas, get_usage, reset_usage
 from app.services.memory.preferences import get_preferences, update_preferences
@@ -278,6 +281,85 @@ def get_my_capabilities(current_user: UserModel = Depends(get_current_user)):
         all_capabilities=all_capabilities,
         granted_permissions=[] if all_permissions else sorted(cfg.granted_permissions),
         all_permissions=all_permissions,
+    )
+
+
+class UserDocumentAccessItem(BaseModel):
+    id: uuid.UUID
+    title: str
+    department: str | None
+    security_classification: str
+
+
+class UserDocumentAccessResponse(BaseModel):
+    role: str
+    department: str | None
+    # None means the LLM-RBAC kill switch is off — no department restriction
+    # at all, matching knowledge_departments_for()'s own None convention.
+    knowledge_departments: list[str] | None
+    can_view: bool
+    can_upload: bool
+    can_delete: bool
+    can_manage: bool
+    total_visible: int
+    documents: list[UserDocumentAccessItem]
+
+
+@router.get(
+    "/users/{user_id}/document-access", response_model=UserDocumentAccessResponse,
+    dependencies=[Depends(require_permission(Permission.VIEW_USERS))],
+)
+def get_user_document_access(user_id: uuid.UUID, limit: int = 200, db: Session = Depends(get_db)):
+    """What routers/documents.py's own list_documents() would return for this
+    user — the exact same two-stage filter (department/category via
+    filter_by_category(), then the per-document permission ACL via
+    filter_by_permission()), just run for a target user instead of the
+    caller. Reviewing an account should show its REAL, current document
+    visibility, not something inferred from role/department alone — a
+    document's own `access_roles` override or a per-user PermissionModel
+    grant/restriction can widen or narrow it beyond what the role implies.
+
+    Gated on VIEW_USERS (the same permission that already lets HR/PM/CEO/
+    Admin see the user list at all) rather than a new permission — this is a
+    detail view on a resource those roles can already see, not a new
+    authority tier.
+    """
+    target = db.get(UserModel, user_id)
+    if target is None:
+        raise AppError(404, "user_not_found", f"User {user_id} not found")
+
+    granted = role_config(target.role).granted_permissions
+
+    def _has(perm: Permission) -> bool:
+        return perm.value in granted or "*" in granted
+
+    knowledge_departments = policy_loader.knowledge_departments_for(target.role)
+    visible_ids = filter_by_category(db, None, target.role, knowledge_departments)
+    visible_ids = filter_by_permission(db, visible_ids, target.id, target.role)
+
+    rows = (
+        db.query(DocumentModel)
+        .filter(DocumentModel.id.in_(visible_ids))
+        .order_by(DocumentModel.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return UserDocumentAccessResponse(
+        role=target.role,
+        department=target.department,
+        knowledge_departments=list(knowledge_departments) if knowledge_departments is not None else None,
+        can_view=_has(Permission.VIEW_DOCUMENTS),
+        can_upload=_has(Permission.UPLOAD_DOCUMENTS),
+        can_delete=_has(Permission.DELETE_DOCUMENTS),
+        can_manage=_has(Permission.MANAGE_DOCUMENTS),
+        total_visible=len(visible_ids),
+        documents=[
+            UserDocumentAccessItem(
+                id=r.id, title=r.title or r.filename, department=r.department,
+                security_classification=r.security_classification,
+            )
+            for r in rows
+        ],
     )
 
 

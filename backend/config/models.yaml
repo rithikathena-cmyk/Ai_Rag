@@ -1,5 +1,11 @@
 # Claude Gateway model routing.
 #
+# Opus is intentionally not used anywhere in this table — every tier below
+# resolves to sonnet or haiku only. `reasoning`/`opus` keep their names for
+# the callers that reference them (see below), they just no longer point at
+# an Opus model; repointing the tier is how a model class gets swapped out
+# without touching every call site that named the tier.
+#
 # `fast`/`sonnet` and `reasoning`/`opus` are the same tier under two names:
 # services/llm_rbac/engine.py resolves a role to `haiku`/`sonnet`/`opus` (per
 # backend/config/llm_rbac.yaml's per-role tiers_allowed — the role-based
@@ -10,9 +16,15 @@
 # `haiku` has no such fast/reasoning-style alias — it's role-driven only.
 tiers:
   fast:
-    model: claude-opus-5
+    # Internal utility calls (router classification, memory summarization,
+    # query rewrite, generation judge) — small prompts, small outputs, always
+    # on the hot path of a request. Haiku fits what "fast" actually means
+    # here; it was pointed at Opus before, which made a handful of tiny
+    # internal calls the slowest thing on every turn.
+    model: claude-haiku-4-5-20251001
     max_tokens: 4096
     effort: medium
+    supports_extended_reasoning: false
   haiku:
     # Cheapest/fastest role-driven tier — the only tier an Employee-role
     # request can ever resolve to (backend/config/llm_rbac.yaml
@@ -36,17 +48,20 @@ tiers:
     max_tokens: 4096
     effort: medium
   reasoning:
-    # Complex planning / multi-step reasoning.
-    model: claude-opus-5
+    # Complex planning / multi-step reasoning. This is now the SAME model as
+    # `sonnet` — Sonnet is the ceiling tier in this deployment; there is no
+    # Opus tier to escalate to above it.
+    model: claude-sonnet-5
     max_tokens: 4096
     effort: high
   opus:
-    # High-capability tier for HR/PM action-based escalation and CEO/Admin
-    # dynamic routing (backend/config/llm_rbac.yaml). Same model as
-    # `reasoning` — kept as separate config keys so gateway callers can use
-    # whichever name matches their own vocabulary (capability tier vs. model
-    # family) without the two ever drifting apart if one is repointed later.
-    model: claude-opus-5
+    # HR/PM action-based escalation and CEO/Admin dynamic routing
+    # (backend/config/llm_rbac.yaml) still name this tier — the role policy
+    # is about relative capability, not a specific model family — but it now
+    # resolves to Sonnet rather than an actual Opus model. Same value as
+    # `reasoning`, kept as a separate config key for the reason in this
+    # file's header.
+    model: claude-sonnet-5
     max_tokens: 4096
     effort: high
 

@@ -50,14 +50,47 @@ def test_deterministic_block_short_circuits_before_gliner_check_runs(monkeypatch
     assert "gliner_check" not in [s.name for s in result.steps]
 
 
-def test_input_gliner_block_verdict_blocks_the_whole_pipeline(monkeypatch):
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(enabled=True)})
-    _stub_model(monkeypatch, [{"start": 0, "end": 16, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.9}])
+def test_input_gliner_redacts_a_validated_candidate_and_does_not_block(monkeypatch):
+    """Current contract (see gliner_check.py's docstring): a successful
+    GLiNER detection redacts, it never blocks on its own — only the
+    detector's own failure path still blocks."""
+    from app.core.config import settings
 
-    result = pipeline.run_input_guardrails("I live at 42 Oakwood Lane, can you help me with something else?")
+    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(enabled=True)})
+    _stub_model(monkeypatch, [{"start": 10, "end": 25, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.9}])
+    original = settings.guardrail_pii_block_input
+    settings.guardrail_pii_block_input = False
+    try:
+        result = pipeline.run_input_guardrails("I live at 42 Oakwood Lane, what's the weather like today")
+    finally:
+        settings.guardrail_pii_block_input = original
+
+    assert "42 Oakwood Lane" not in result.text
+    assert "[REDACTED_PHYSICAL_ADDRESS]" in result.text
+    gliner_result_step = next(s for s in result.steps if s.name == "gliner_check")
+    assert gliner_result_step.action == "redact"
+
+
+def test_input_gliner_redact_blocks_when_block_input_policy_is_on(monkeypatch):
+    """Same detection as above, but with guardrail_pii_block_input=True
+    (this deployment's own regex pii_redact already respects this exact
+    setting on input) — GLiNER's redact result must be gated by the same
+    policy, not quietly softer than the check right next to it."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(enabled=True)})
+    _stub_model(monkeypatch, [{"start": 10, "end": 25, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.9}])
+    original = settings.guardrail_pii_block_input
+    settings.guardrail_pii_block_input = True
+    try:
+        result = pipeline.run_input_guardrails("I live at 42 Oakwood Lane, what's the weather like today")
+    finally:
+        settings.guardrail_pii_block_input = original
 
     assert result.blocked is True
+    assert result.blocking_step_name == "gliner_check"
     assert "personal information" in result.block_reason.lower()
+    assert "42 Oakwood Lane" not in result.block_reason
 
 
 def test_input_gliner_runs_after_presidio_check(monkeypatch):
@@ -86,16 +119,17 @@ def test_output_gliner_check_runs_after_presidio_check(monkeypatch):
     assert result.blocked is False
 
 
-def test_output_gliner_block_verdict_blocks_the_reply(monkeypatch):
+def test_output_gliner_redacts_a_validated_candidate_into_the_reply(monkeypatch):
     monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(enabled=True)})
     _stub_model(
-        monkeypatch, [{"start": 0, "end": 16, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.9}]
+        monkeypatch, [{"start": 32, "end": 47, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.9}]
     )
 
     result = pipeline.run_output_guardrails("The employee's home address is 42 Oakwood Lane.")
 
-    assert result.blocked is True
-    assert "42 Oakwood Lane" not in result.block_reason
+    assert result.blocked is False
+    assert "42 Oakwood Lane" not in result.text
+    assert "[REDACTED_PHYSICAL_ADDRESS]" in result.text
 
 
 def test_output_gliner_pass_still_runs_deterministic_pii_redaction_after(monkeypatch):
@@ -106,9 +140,15 @@ def test_output_gliner_pass_still_runs_deterministic_pii_redaction_after(monkeyp
 
     assert result.blocked is False
     assert "jane@example.com" not in result.text
+    # EMAIL's safe default output action is REDACT — a full opaque
+    # replacement, not a partial mask (see services/guardrail_policy/
+    # pii_policy.py's _SAFE_PII_DEFAULTS and pii.py's _resolve_match()).
     assert "[REDACTED_EMAIL]" in result.text
     step_names = [s.name for s in result.steps]
-    assert step_names == ["system_prompt_leak_check", "toxicity_check", "presidio_check", "gliner_check", "pii_redact"]
+    assert step_names == [
+        "prompt_injection_check", "system_prompt_leak_check", "toxicity_check", "presidio_check",
+        "gliner_check", "pii_redact",
+    ]
 
 
 def test_output_gliner_infra_failure_fails_closed_by_default(monkeypatch):

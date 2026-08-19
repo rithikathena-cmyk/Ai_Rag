@@ -9,6 +9,23 @@ import re
 
 _INDIAN_MOBILE_PREFIXES = "6789"
 
+_DIGIT_WORD_MAP = {
+    "zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+
+
+def digit_words_to_digits(value: str) -> str:
+    """Converts a pii_patterns.PHONE_SPELLED_OUT_RE match ("two zero six ...")
+    into its digit-character equivalent ("206...") so the ordinary digit-
+    based canonicalize_phone/is_valid_phone pipeline — built for digit
+    characters, not English words — can validate it unchanged. Case-
+    insensitive on the word itself; unrecognized words (shouldn't occur,
+    since the regex only matches the words in _DIGIT_WORD_MAP to begin
+    with) contribute nothing rather than raising."""
+    words = re.findall(r"[A-Za-z]+", value)
+    return "".join(_DIGIT_WORD_MAP.get(w.lower(), "") for w in words)
+
 # Verhoeff checksum tables — the algorithm UIDAI uses for Aadhaar's 12th
 # (check) digit. Unlike a simple mod-10/Luhn check, Verhoeff catches all
 # single-digit errors and all adjacent-transposition errors, which is why
@@ -49,6 +66,18 @@ def normalize_email(value: str) -> str:
     RFC 5321, but no real provider enforces that, so treating the whole
     thing as case-insensitive matches actual behavior)."""
     return value.strip().lower()
+
+
+def is_valid_spelled_out_email(value: str) -> bool:
+    """The real structural gate for pii_patterns.EMAIL_SPELLED_OUT_RE, which
+    on its own only requires a 4+-word chain joined by dot/at/hyphen/dash/
+    underscore — loose enough to tolerate a spelled-out hyphen inside a
+    domain label ("harborline hyphen test"), but too loose on its own to
+    rule out an unrelated run-on sentence. Requiring >=1 "at" AND >=2 "dot"
+    as whole words is the same signal the original rigid pattern encoded
+    structurally (one dot-segment on each side of "at"); checking it here
+    instead lets the regex's word/connector shape stay flexible."""
+    return bool(re.search(r"\bat\b", value, re.IGNORECASE)) and len(re.findall(r"\bdot\b", value, re.IGNORECASE)) >= 2
 
 
 def normalize_phone(value: str) -> str:
@@ -96,29 +125,44 @@ def canonicalize_phone(value: str) -> str:
     return digits
 
 
+_NANP_LOCAL_LENGTH = 7  # NANP local number: 3-digit exchange + 4-digit subscriber, no area code (e.g. "555-0199")
+
+
 def is_valid_phone(value: str) -> bool:
-    """True if `value` normalizes to a plausible phone number. Two
+    """True if `value` normalizes to a plausible phone number. Three
     acceptance paths: (1) a 10-digit Indian mobile number, after stripping
     any '0' trunk / '91' country prefix, starting with a valid mobile
     prefix (6-9) — checked first since it's the most specific/confident
     signal available; (2) a generic international number for every other
     supported format (+1 US, +44 UK, ...), where no prefix-table validation
-    is practical without a full numbering-plan database.
+    is practical without a full numbering-plan database; (3) a bare 7-digit
+    NANP local number (no area code, e.g. "555-0199") — the shortest
+    accepted length, and NOT on its own sufficient to redact: this function
+    only decides "shaped like a phone number," and pii.py's PHONE recognizer
+    additionally requires phone_confidence() != "low" before actually
+    redacting (context word or internal formatting), same as every other
+    length here — a bare, unformatted 7-digit run with nothing else
+    (an employee ID, ticket number, or quantity that happens to be 7 digits)
+    stays LOW and is left untouched. See pii_patterns.py's test suite for
+    the calibration this mirrors at 10/12 digits.
 
-    The generic path caps at 12 bare digits *without* an explicit '+', not
-    E.164's full 15 — a bare 13-16 digit run with no country-code marker is
-    at least as likely to be a credit-card number (CREDIT_CARD_RE's own
-    range), and PHONE is checked before CREDIT_CARD in pii.py's recognizer
-    order specifically so a real phone number wins that ambiguity; without
-    this cap PHONE would instead swallow genuine card numbers first. An
-    explicit '+' is treated as an unambiguous "this is a country-coded
-    phone number" marker, so it's allowed the full E.164 range."""
+    The generic (non-NANP-local) path caps at 12 bare digits *without* an
+    explicit '+', not E.164's full 15 — a bare 13-16 digit run with no
+    country-code marker is at least as likely to be a credit-card number
+    (CREDIT_CARD_RE's own range), and PHONE is checked before CREDIT_CARD in
+    pii.py's recognizer order specifically so a real phone number wins that
+    ambiguity; without this cap PHONE would instead swallow genuine card
+    numbers first. An explicit '+' is treated as an unambiguous "this is a
+    country-coded phone number" marker, so it's allowed the full E.164
+    range."""
     digits = normalize_phone(value)
     core = _strip_indian_prefixes(digits)
     if len(core) == 10 and core[0] in _INDIAN_MOBILE_PREFIXES:
         return True
     if value.strip().startswith("+"):
         return 10 <= len(digits) <= 15
+    if len(digits) == _NANP_LOCAL_LENGTH:
+        return True
     return 10 <= len(digits) <= 12
 
 
@@ -152,7 +196,19 @@ def phone_confidence(full_text: str, match_start: int, match_end: int, raw_value
     window_after = full_text[match_end : match_end + _PHONE_CONTEXT_WINDOW]
     if _PHONE_CONTEXT_RE.search(window_before) or _PHONE_CONTEXT_RE.search(window_after):
         return "high"
-    if re.search(r"[\s\-()]", raw_value):
+    # A digit run glued directly onto a preceding '-' with no space (e.g.
+    # "GEN-INC-ENG-2026-009") is almost always the numeric tail of a larger
+    # hyphen-joined reference/document/case ID, not a standalone phone
+    # number — a real phone number is never written hyphen-glued onto a
+    # letter prefix like that. Live-verified false positive: exactly this
+    # shape (a year-then-sequence document ID suffix, e.g. "2026-009") was
+    # redacted as PHONE with zero phone context nearby, purely because its
+    # own internal hyphen satisfied the formatting check below. Internal
+    # hyphen/space formatting alone isn't a reliable medium-confidence
+    # signal in that position, so it's excluded here; a genuine nearby
+    # context word can still promote it to HIGH via the check above.
+    glued_onto_hyphenated_prefix = match_start > 0 and full_text[match_start - 1] == "-"
+    if not glued_onto_hyphenated_prefix and re.search(r"[\s\-()]", raw_value):
         return "medium"
     return "low"
 
@@ -248,3 +304,40 @@ def has_dob_context(full_text: str, match_start: int) -> bool:
     positives on ordinary content."""
     window = full_text[max(0, match_start - _DOB_CONTEXT_WINDOW) : match_start]
     return bool(_DOB_CONTEXT_RE.search(window))
+
+
+def normalize_card(value: str) -> str:
+    """Digits only — cards are written with spaces or hyphens in groups of
+    four at least as often as they are written bare."""
+    return re.sub(r"\D", "", value)
+
+
+def is_valid_card(value: str) -> bool:
+    """Luhn check digit plus a length gate.
+
+    CREDIT_CARD_RE matches any 13-16 digit run, which is a very common shape:
+    order references, batch numbers, and concatenated internal IDs all hit it.
+    Without a checksum every one of those is redacted as a payment card, which
+    both damages legitimate answers and trains users to distrust the
+    redaction.
+
+    Every real card number satisfies Luhn by construction, so this costs no
+    true-positive coverage. The tradeoff it does make is a mistyped card
+    number goes unredacted — acceptable, because a number that fails Luhn is
+    not a usable card and therefore not the value being protected.
+
+    Mirrors is_valid_aadhaar()'s Verhoeff approach: structural shape decides
+    candidacy, an arithmetic check digit decides validity.
+    """
+    digits = normalize_card(value)
+    if not 13 <= len(digits) <= 16 or not digits.isdigit():
+        return False
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0

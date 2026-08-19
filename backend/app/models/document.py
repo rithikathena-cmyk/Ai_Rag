@@ -45,6 +45,14 @@ class DocumentModel(Base):
     classification_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
     chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # PII visibility metadata (services/guardrails/pii.py::find_pii_labels() +
+    # gliner_check.py, computed once at upload time — see routers/
+    # documents.py's upload_document()). Label names only, never the matched
+    # spans — same "labels only, never values" rule every other guardrail
+    # audit surface in this codebase follows.
+    contains_pii: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    pii_types: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     lineage_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)

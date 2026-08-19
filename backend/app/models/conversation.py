@@ -17,6 +17,10 @@ class ConversationModel(Base):
     )
     title: Mapped[str | None] = mapped_column(String(256), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Non-null = pinned, sorted to the top of the conversation list; the
+    # timestamp itself (not just a bool) lets multiple pinned conversations
+    # order by most-recently-pinned rather than an arbitrary/insertion order.
+    pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Total messages ever stored (cheap threshold check without a COUNT query).
     message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # How many of the oldest messages have already been folded into `summary`

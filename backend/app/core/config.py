@@ -140,7 +140,11 @@ class Settings(BaseSettings):
     password_hash_iterations: int = 390000
 
     anthropic_api_key: str = ""
-    claude_model_name: str = "claude-opus-5"
+    # Unused by any call path today — every real call resolves its model
+    # through model_router.py/config/models.yaml instead (see that file's
+    # header). Kept only as a documented fallback default; not an Opus model,
+    # matching the rest of this deployment's tier table.
+    claude_model_name: str = "claude-sonnet-5"
     claude_max_tokens: int = 2048
     claude_effort: str = "medium"
     chat_context_top_k: int = 5
@@ -181,6 +185,32 @@ class Settings(BaseSettings):
     # guidance (prompts/planner_agent_v3.yaml), which should make hitting this
     # ceiling rare regardless of headroom.
     agent_max_tool_iterations: int = 6
+    # Multi-agent supervisor/router (services/agents/router.py) — a
+    # RoutingDecision with confidence below this is never trusted for
+    # routing; chat.py asks the user to clarify instead of guessing which
+    # specialized agent to hand the request to. 0.5 is a deliberately
+    # conservative floor: an ambiguous/low-confidence guess routed to the
+    # wrong domain agent is a worse UX than one clarifying question.
+    agent_router_confidence_threshold: float = 0.5
+    agent_router_timeout_seconds: float = 5.0
+    # Any ModelTier value — validated at call time in router.py, falls back
+    # to "fast" if misconfigured.
+    #
+    # "sonnet", not "fast": this is a judgment call, not a throughput one.
+    # Live-reproduced on config/models.yaml's current tier table (fast =
+    # Haiku, no Opus tier exists here): a real, correctly-answerable compound
+    # question ("who reported X, and what's their contact info?") classified
+    # at confidence 0.40-0.45 on Haiku, consistently under the 0.5 floor
+    # above — three runs, same result. Below that floor chat.py returns the
+    # "could you rephrase?" clarification WITHOUT ever calling run_agent(),
+    # so a real answerable question gets refused. That is exactly the failure
+    # mode this module's own confidence gate exists to prevent (a wrong guess
+    # is worse than asking — but a false "I don't understand" on a real
+    # question is worse still), so this classification call gets the
+    # stronger tier even though the request itself is small. See
+    # generation_judge.py's tier comment for the same reasoning applied to
+    # eval scoring.
+    agent_router_tier: str = "sonnet"
     # A search_documents call using the user's own message verbatim as the
     # query, that always runs once before the agent's own (LLM-chosen,
     # sampled) tool calls — see docs/RAG_RETRIEVAL.md. Exists because every
@@ -223,8 +253,13 @@ class Settings(BaseSettings):
     # match with a salted, deterministic short hash ([REDACTED_EMAIL_a1b2c3d4])
     # instead, so the same value always redacts to the same token within one
     # deployment (useful for correlating "same person mentioned twice" without
-    # ever storing/exposing the real value) while staying non-reversible.
-    guardrail_pii_mode: str = "placeholder"  # "placeholder" | "hash"
+    # ever storing/exposing the real value) while staying non-reversible;
+    # "mask" partially reveals PHONE/EMAIL (e.g. "89#######7", "mj#####.com" —
+    # see pii.py's _mask_phone/_mask_email) and falls back to the opaque
+    # placeholder token for every other PII type. Default is "mask" per the
+    # confirmed policy that any PII a user asks about comes back masked, not
+    # withheld outright or fully opaque.
+    guardrail_pii_mode: str = "mask"  # "placeholder" | "hash" | "mask"
     # Dev-safe default so the app still boots without a .env, exactly like
     # jwt_secret_key above — override with a long random value in production.
     # Salting matters even for a "hash": an *unsalted* hash of a low-entropy
@@ -232,19 +267,57 @@ class Settings(BaseSettings):
     # (only ~1 billion possible SSNs) — the salt is what makes it actually
     # non-reversible, not the hash function alone.
     guardrail_pii_hash_salt: str = "dev-insecure-pii-salt-change-me"
-    # When True (the default), a message containing PII is blocked outright
-    # — it never reaches Claude, redacted or not. When False, restores the
-    # original behavior: PII is redacted in place and the redacted message
-    # still proceeds. Output-side PII (Claude's reply) is never blocked
-    # either way, only ever redacted — the model already generated it by
-    # that point; redaction is what's left to do.
-    guardrail_pii_block_input: bool = True
+    # When True, a message containing PII is blocked outright — it never
+    # reaches Claude, redacted or not. When False (now the default), PII is
+    # masked/redacted in place and the message still proceeds. Output-side
+    # PII (Claude's reply) is never blocked either way, only ever redacted —
+    # the model already generated it by that point; redaction is what's left
+    # to do.
+    #
+    # Default flipped to False alongside the uniform PII policy in
+    # guardrail_policy/pii_policy.py. That policy resolves personal data to
+    # MASK on input, and MASK is only meaningful if the request continues —
+    # _resolve_match() reports MASK as status "redact", so leaving this True
+    # would turn every masked identifier straight back into a hard block and
+    # the MASK tier would never be reachable. Credentials are unaffected:
+    # they resolve to BLOCK, which this flag does not govern.
+    guardrail_pii_block_input: bool = False
+
+    # Whether the raw, pre-redaction value of a detected PII entity is
+    # captured to the separate pii_occurrences table (models/pii_occurrence.py)
+    # for later admin-permissioned recovery (Permission.PII_VIEW_RAW,
+    # routers/pii_access.py) — never into `messages.content`/`messages.trace`
+    # either way. Default OFF: retaining a recoverable copy of raw PII is an
+    # explicit business decision a deployment opts into, not an automatic
+    # side effect of turning guardrails on. With this off, behavior is
+    # unchanged from before this capability existed — nothing new is stored,
+    # nothing new is queryable, the PII_VIEW_RAW endpoint returns 404 for
+    # every entity because no occurrence rows ever exist.
+    guardrail_pii_raw_capture_enabled: bool = False
 
     # Employee-ID recognizer is opt-in and config-driven — there's no single
     # correct shape ("EMP-12345" vs "EMP12345" vs an org-specific scheme
     # entirely), so the recognizer stays off (None) until a deployment
     # supplies its own pattern, rather than guessing at one convention.
     guardrail_employee_id_pattern: str | None = None
+    # Internal reference-ID shape (employee IDs, incident IDs, ticket
+    # numbers, ...) this deployment's own documents/queries use — used ONLY
+    # to veto GLiNER's "government-issued identification number" label when
+    # a candidate independently matches this shape (see
+    # gliner_validators.py's _is_internal_reference_id), never to activate a
+    # PII-type recognizer of its own. Deliberately separate from
+    # guardrail_employee_id_pattern above: that setting controls whether
+    # employee IDs are tracked/redacted as a distinct PII TYPE at all (an
+    # opt-in product decision this deployment has NOT made — see
+    # services/guardrail_policy/entities.py's EMPLOYEE_ID row,
+    # Detection.NONE), while this one only prevents an unrelated,
+    # already-characterized false positive (GLiNER misclassifying this
+    # deployment's own ID format as a government ID — see guardrails.yaml's
+    # gliner_check comment) from firing at all. Defaults ON (unlike
+    # guardrail_employee_id_pattern) because this specific false positive is
+    # already measured and fixed, not a generic capability a deployment must
+    # separately opt into.
+    guardrail_internal_id_pattern: str | None = r"[A-Z]{3}-[A-Z]{3}-\d{5}"
     # Bank-account detection is off by default — an 8-18 digit run is
     # genuinely ambiguous (order id, reference code, phone number) without
     # real context, and a keyword-anchored regex only partially addresses
@@ -270,6 +343,12 @@ class Settings(BaseSettings):
     # idempotently on startup — see db/postgres.py::_bootstrap_admin_user.
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
+
+    # One-click demo login (routers/auth.py's /auth/demo-users, /auth/demo-login)
+    # — lets the login page sign in as a real seeded account per role without
+    # typing a password. Defaults on since this app is a demo/evaluation
+    # platform; set False for a real production deployment.
+    demo_login_enabled: bool = True
 
     # Upload security
     upload_mime_check_enabled: bool = True

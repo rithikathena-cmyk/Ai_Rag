@@ -147,6 +147,46 @@ def test_pan_negative(text):
     assert "[REDACTED_PAN]" not in result
 
 
+# ----------------------------------------------------------------- ssn ---
+
+_POSITIVE_SSN = [
+    "123-45-6789",  # original, hyphenated
+    "123 45 6789",  # space-separated — found missing live, see pii_patterns.py
+]
+
+
+@pytest.mark.parametrize("ssn", _POSITIVE_SSN)
+def test_ssn_positive(ssn):
+    text, step = redact_pii(f"My SSN is {ssn}, check my file.")
+    assert ssn not in text
+    assert "[REDACTED_SSN]" in text
+    assert step.action == "redact"
+
+
+def test_ssn_mixed_separators_still_redact():
+    # "[- ]" is a per-position choice, not a requirement that both
+    # separators in a match be the same one — a mixed "123-45 6789" is
+    # still a valid SSN shape and is expected to redact. Documented here so
+    # a future change tightening the pattern to same-separator-only doesn't
+    # silently drop this coverage without a deliberate decision.
+    text, step = redact_pii("SSN 123-45 6789 on file")
+    assert "123-45 6789" not in text
+    assert "[REDACTED_SSN]" in text
+
+
+_NEGATIVE_SSN = [
+    "Room 123 building 45 floor 6789",  # unrelated numbers, not adjacent
+    "123 45 67890",  # 5 digits in the last group, not a valid SSN shape
+    "12 345 6789",  # wrong group sizes
+]
+
+
+@pytest.mark.parametrize("text", _NEGATIVE_SSN)
+def test_ssn_negative(text):
+    result, step = redact_pii(text)
+    assert "[REDACTED_SSN]" not in result
+
+
 # ------------------------------------------------------------- aadhaar ---
 
 
@@ -247,6 +287,100 @@ def test_phone_confidence_does_not_regress_existing_recall():
     for phone in ("9876543210", "+91 9876543210", "98765-43210", "98765 43210"):
         _redacted, step = redact_pii(f"call me at {phone} tomorrow")
         assert step.action == "redact", phone
+
+
+_HYPHENATED_ID_SUFFIX_NOT_REDACTED = [
+    "the conveyor jam incident (GEN-INC-ENG-2026-009)",
+    "Document ID: GEN-INC-ENG-2026-009 | Filename: eng_incident_report_conveyor_jam.md",
+    "invoice INV-2026-0043 is overdue",
+    "case CASE-24-0091 was escalated",
+    "ticket TICKET-2026-445 was reopened",
+]
+
+
+@pytest.mark.parametrize("text", _HYPHENATED_ID_SUFFIX_NOT_REDACTED)
+def test_hyphen_glued_document_id_suffix_is_not_redacted(text):
+    """Live-verified false positive: a document/case/invoice ID whose
+    trailing hyphen-separated digit group (e.g. "2026-009") happens to be
+    phone-shaped (7 digits split by a hyphen) was getting redacted as PHONE
+    with zero phone context nearby, purely because that internal hyphen
+    alone satisfied the MEDIUM-confidence formatting check — see
+    phone_confidence()'s "glued_onto_hyphenated_prefix" guard. A real phone
+    number is never written hyphen-glued directly onto a letter prefix like
+    this (no space before the digits), which is what distinguishes this
+    case from a genuine formatted phone number."""
+    redacted, step = redact_pii(text)
+    assert redacted == text
+    assert step.action == "pass"
+
+
+def test_hyphen_glued_id_suffix_still_redacts_with_explicit_phone_context():
+    """The guard above only suppresses the *formatting-alone* signal — an
+    explicit phone-context word nearby still promotes to HIGH confidence
+    and redacts, even for a hyphen-glued value."""
+    redacted, step = redact_pii("call me at REF-206-5550")
+    assert redacted != "call me at REF-206-5550"
+    assert step.action == "redact"
+
+
+# --------------------------------------------- NANP local-format phone ---
+# 7-digit numbers with no area code ("555-0199") — previously a live,
+# undetected gap: is_valid_phone() required >=10 digits for every path
+# except the 10-digit Indian mobile shape, so a bare local-format US number
+# scored "No PII detected" outright, before phone_confidence() (context/
+# formatting) ever got a say. redact_pii() is also what
+# services/guardrails/pii_intent.py's employee-PII approval masking reuses
+# (see test_pii_intent.py), so this fix applies there too, not just the
+# general chat pipeline.
+
+_NANP_LOCAL_POSITIVE = [
+    "Call me at 555-0199 tomorrow.",
+    "Phone: 555-0100",
+    "Contact number is 555-0199.",
+    "(555) 0199",
+]
+
+
+@pytest.mark.parametrize("text", _NANP_LOCAL_POSITIVE)
+def test_nanp_local_format_phone_redacts(text):
+    redacted, step = redact_pii(text)
+    assert "555-0199" not in redacted and "555-0100" not in redacted and "5550199" not in redacted
+    assert "[REDACTED_PHONE]" in redacted
+    assert step.action == "redact"
+    assert "PHONE" in step.detail
+
+
+def test_nanp_local_format_preserves_expected_token_shape():
+    text, step = redact_pii("Call me at 555-0199 tomorrow.")
+    assert text == "Call me at [REDACTED_PHONE] tomorrow."
+
+
+_NANP_LOCAL_NOT_REDACTED = [
+    "Order quantity: 5550199 units",  # bare digits, no context, no formatting -> LOW
+    "Ticket #5550199 was closed.",  # bare digits, no context, no formatting -> LOW
+    "Reference DB-5550199 stored.",  # bare digits after a label, no phone context -> LOW
+    "Employee ID EMP0055199 was on shift.",  # not even a candidate: contiguous with letters, no boundary
+]
+
+
+@pytest.mark.parametrize("text", _NANP_LOCAL_NOT_REDACTED)
+def test_bare_seven_digit_run_without_phone_context_is_not_redacted(text):
+    """Same LOW-confidence gate that already protects the 10/12-digit paths
+    (test_bare_digit_run_without_phone_context_is_not_redacted above) —
+    extended to 7 digits, not a new, weaker rule: a bare, unformatted
+    7-digit run with no phone-context word is exactly as likely to be an
+    employee ID, ticket number, or quantity as a phone number."""
+    redacted, step = redact_pii(text)
+    assert redacted == text
+    assert step.action == "pass"
+
+
+def test_existing_area_code_formats_still_redact_unaffected_by_nanp_local_change():
+    """Preserve existing detection for full (area-code-included) formats —
+    the 7-digit NANP-local acceptance is a new, additional path, not a
+    replacement for the existing 10/12-digit one."""
+    for text in ("(202) 555-0198", "202-555-0198", "+1-202-555-0198", "Phone: 9876543210"):
+        assert redact_pii(text)[1].action == "redact", text
 
 
 # ---------------------------------------------------------------- IP address ---

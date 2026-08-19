@@ -28,6 +28,10 @@ from app.services.guardrails.decisions import GuardrailDecision
 # with here." for every low-similarity scope outcome regardless of cause.
 _TEMPLATES: dict[str, str] = {
     "prompt_injection": "I'm not able to help with that request.",
+    "secret_detected": (
+        "I can't process messages that appear to contain an API key, password, or other credential "
+        "— please remove it and try again."
+    ),
     "destructive_intent": (
         "I can't perform destructive actions like that, and this assistant has no ability to modify or delete anything."
     ),
@@ -43,13 +47,25 @@ _TEMPLATES: dict[str, str] = {
     "system_prompt_leak": "I'm not able to share that.",
     "toxicity_output": "I can't share that response because it may contain harmful or abusive content.",
     "pii_detected_output": "I can't share that response because it may contain sensitive personal information.",
+    "groundedness_check_unavailable": (
+        "I wasn't able to verify that this response is properly grounded in the retrieved documents, "
+        "so I can't share it. Please try again."
+    ),
     "scope_keyword": (
-        "That request falls outside the areas this assistant currently supports. "
+        "That request is outside the enterprise knowledge scope this assistant supports. "
         "I can help with questions related to the enterprise knowledge base."
     ),
     "semantic_scope": (
-        "That request falls outside the areas this assistant currently supports. "
+        "That request is outside the enterprise knowledge scope this assistant supports. "
         "I can help with questions related to the enterprise knowledge base."
+    ),
+    # mixed_scope is handled entirely in generate_user_response() below (it
+    # needs the safe topic label from `detail`) — this entry is the fallback
+    # for the case detail is somehow missing, so the map lookup never falls
+    # through to the generic _DEFAULT sentence for this reason.
+    "mixed_scope": (
+        "Part of your request is outside the enterprise knowledge scope this assistant supports. "
+        "I can help with the rest — try asking just the in-scope part."
     ),
     "pii_reference": (
         "I see you've shared contact information — what would you like me to do with it? "
@@ -57,6 +73,7 @@ _TEMPLATES: dict[str, str] = {
     ),
     "document_reference": "I found something matching that reference — what would you like to know about it?",
     "insufficient_context": "I'm not quite sure what you'd like me to do with that. Could you tell me what you'd like to know?",
+    "custom_policy_rule": "That request violates one of this organization's configured content policies.",
 }
 
 _DEFAULT = "I'm not able to help with that request."
@@ -70,4 +87,20 @@ def generate_user_response(decision: GuardrailDecision, detail: str | None = Non
     # raw message" guarantee meaningful for every other case.
     if decision.reason == "length" and detail:
         return f"Your message couldn't be processed: {detail}."
+    # mixed_scope is the other reason detail-dependent, on the same
+    # guarantee, not an exception to it: scope_semantic_check.py's
+    # MIXED_NAME step puts a SAFE, admin-configured topic label (never the
+    # caller's own text) on the first line of detail specifically so this
+    # function can use it without ever seeing what the caller actually
+    # wrote. Everything after that first line is audit-only detail meant for
+    # /traces, not for this templated reply — deliberately never read here.
+    if decision.reason == "mixed_scope" and detail:
+        label = detail.split("\n", 1)[0].strip()
+        if label:
+            return (
+                f"I can help with the part of your message about {label} — the rest falls outside the "
+                "enterprise knowledge this assistant supports, so I've left that part unanswered. Feel free "
+                f"to ask about {label} directly, or rephrase the rest if it's actually related to our "
+                "internal documents or policies."
+            )
     return _TEMPLATES.get(decision.reason, _DEFAULT)

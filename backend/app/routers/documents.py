@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.errors import AppError
 from app.core.permissions import Permission
+from app.core.request_context import get_current_request_id
 from app.db.postgres import get_db
 from app.gateway.usage_tracker import record_denied
 from app.models.approval_request import ApprovalRequestModel
@@ -25,6 +26,8 @@ from app.models.entity import EntityModel
 from app.models.permission import PermissionModel
 from app.models.upload_log import UploadLogModel
 from app.models.user import UserModel
+from app.services.audit import logger as audit_logger
+from app.services.audit.event_types import AuditEventType, AuditOutcome
 from app.services.auth.dependencies import get_current_user
 from app.services.auth.rbac import require_permission
 from app.services.chunking import text_utils
@@ -33,7 +36,9 @@ from app.services.chunking.persistence import build_chunk_rows
 from app.services.embedding.model_loader import embed_texts
 from app.services.embedding.qdrant_store import delete_document_points, upsert_chunks
 from app.services.entities.persistence import build_entity_rows
-from app.services.guardrails.retrieval_permissions import filter_by_category
+from app.services.guardrails.gliner_check import check_with_gliner
+from app.services.guardrails.pii import find_pii_labels
+from app.services.guardrails.retrieval_permissions import filter_by_category, filter_by_permission
 from app.services.ingestion import storage
 from app.services.ingestion.detector import detect_format
 from app.services.ingestion.dispatcher import parse_document
@@ -145,6 +150,24 @@ class EntityResponse(BaseModel):
     entity_text: str
     entity_label: str
     mention_count: int
+
+
+def _document_is_visible(db: Session, document_id: uuid.UUID, current_user: UserModel) -> bool:
+    """The full two-stage visibility check (department/category, then the
+    per-user permission grant + security_classification rail) — same rails
+    services/retrieval/search.py's resolve_document_ids() applies before a
+    document ever reaches Qdrant/the LLM. Every direct single-document GET
+    route below must apply the SAME check retrieval does; before this helper
+    existed, these routes only ever called filter_by_category(), so a
+    document an HR admin explicitly restricted to specific users (or marked
+    security_classification="restricted") was still fully readable by any
+    other user in the same department via a direct GET — the per-user grant
+    system had no effect outside the /chat and /search paths.
+    """
+    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
+    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+        return False
+    return bool(filter_by_permission(db, [document_id], current_user.id, current_user.role))
 
 
 def _to_response(row: DocumentModel) -> DocumentResponse:
@@ -394,6 +417,25 @@ async def upload_document(
     version_number = (previous_doc.version_number + 1) if previous_doc else 1
     previous_version_id = previous_doc.id if previous_doc else None
 
+    # PII visibility metadata (services/guardrails/pii.py::find_pii_labels()
+    # + gliner_check.py) — computed once against the whole document's chunk
+    # text concatenated, not per chunk (a document can have hundreds of
+    # chunks; one GLiNER call per upload is a reasonable cost for an
+    # audit-only tag, one per chunk isn't). Label names only are ever
+    # stored — never the matched spans, same rule every other guardrail
+    # audit surface in this codebase follows. Best-effort: a document that
+    # failed chunking (chunk_rows == []) simply gets no PII signal, same as
+    # it gets no other content-derived metadata in that case.
+    pii_labels: set[str] = set()
+    if chunk_rows:
+        combined_text = "\n".join(c.text for c in chunk_rows)
+        pii_labels.update(find_pii_labels(combined_text))
+        gliner_redacted, gliner_step = check_with_gliner(combined_text)
+        if gliner_redacted != combined_text:
+            pii_labels.update(
+                part.strip() for part in gliner_step.detail.removeprefix("Redacted:").split(",") if part.strip()
+            )
+
     row = DocumentModel(
         id=document_id,
         filename=file.filename,
@@ -423,6 +465,8 @@ async def upload_document(
         classification_confidence=classification.confidence if classification else None,
         classification_method=classification.method if classification else None,
         chunk_count=len(chunk_rows),
+        contains_pii=bool(pii_labels),
+        pii_types=sorted(pii_labels) if pii_labels else None,
         summary=summary_text,
         lineage_id=lineage_id,
         version_number=version_number,
@@ -502,8 +546,7 @@ def get_document(
     row = db.get(DocumentModel, document_id)
     if row is None:
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
-    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
-    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+    if not _document_is_visible(db, document_id, current_user):
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     return _to_response(row)
 
@@ -520,8 +563,7 @@ def get_document_text(
     row = db.get(DocumentModel, document_id)
     if row is None:
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
-    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
-    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+    if not _document_is_visible(db, document_id, current_user):
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     if not row.text_file_path:
         raise AppError(404, "text_not_found", "No parsed text stored for this document")
@@ -568,8 +610,10 @@ def delete_document(
         )
         raise
 
-    if db.get(DocumentModel, document_id) is None:
+    existing = db.get(DocumentModel, document_id)
+    if existing is None:
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
+    filename = existing.filename
 
     if decision.requires_approval:
         # llm_rbac.yaml marks this role's delete as approval-gated (currently
@@ -590,6 +634,11 @@ def delete_document(
         )
 
     delete_document_row(db, document_id)
+    audit_logger.log(
+        AuditEventType.DOCUMENT_DELETE, outcome=AuditOutcome.SUCCESS, request_id=get_current_request_id(),
+        actor_id=current_user.id, actor_role=current_user.role, resource_type="DOCUMENT",
+        resource_id=str(document_id), action="DELETE", metadata={"document_filename": filename},
+    )
     return Response(status_code=204)
 
 
@@ -654,11 +703,14 @@ def list_documents(
     _permission: UserModel = Depends(require_permission(Permission.VIEW_DOCUMENTS)),
 ):
     knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
-    if knowledge_departments is None:
-        query = db.query(DocumentModel)
-    else:
-        visible_ids = filter_by_category(db, None, current_user.role, knowledge_departments)
-        query = db.query(DocumentModel).filter(DocumentModel.id.in_(visible_ids))
+    visible_ids = filter_by_category(db, None, current_user.role, knowledge_departments)
+    # filter_by_permission expects the None-means-"resolve everything" input
+    # contract that filter_by_category's return value already satisfies (a
+    # concrete ID list, category-narrowed) — this is the same two-stage
+    # narrowing _document_is_visible() applies per-document, done once here
+    # over the whole candidate set instead of N times.
+    visible_ids = filter_by_permission(db, visible_ids, current_user.id, current_user.role)
+    query = db.query(DocumentModel).filter(DocumentModel.id.in_(visible_ids))
     query = query.order_by(DocumentModel.created_at.desc())
     total = query.count()
     rows = query.offset(offset).limit(limit).all()
@@ -673,8 +725,7 @@ def get_document_chunks(
 ):
     if db.get(DocumentModel, document_id) is None:
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
-    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
-    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+    if not _document_is_visible(db, document_id, current_user):
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     rows = (
         db.query(ChunkModel)
@@ -714,8 +765,7 @@ def get_document_versions(
     # Previously had no visibility check at all, unlike every sibling GET
     # route above — a role outside this document's department could see its
     # full version lineage. Now consistent with get_document/get_document_text.
-    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
-    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+    if not _document_is_visible(db, document_id, current_user):
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     rows = (
         db.query(DocumentModel)
@@ -744,8 +794,7 @@ def get_document_entities(
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     # Same gap as /versions above — add the visibility check every sibling
     # GET route already has.
-    knowledge_departments = policy_loader.knowledge_departments_for(current_user.role)
-    if not filter_by_category(db, [document_id], current_user.role, knowledge_departments):
+    if not _document_is_visible(db, document_id, current_user):
         raise AppError(404, "document_not_found", f"DocumentModel {document_id} not found")
     rows = (
         db.query(EntityModel)

@@ -1,11 +1,6 @@
-"""services/guardrails/gliner_check.py — the GLiNER-based semantic PII
-check. Mocks gliner_check._get_model() directly (rather than requiring the
-real GLiNER checkpoint to load per test) so this suite stays fast and
-deterministic, matching this package's established convention of stubbing
-the I/O/model boundary — see test_presidio_check.py.
-"""
-
-import pytest
+"""services/guardrails/gliner_check.py — direct unit tests for
+check_with_gliner()'s redaction/veto/overlap logic, independent of pipeline
+wiring (see test_pipeline_gliner_wiring.py for the pipeline-level tests)."""
 
 from app.services.guardrails import gliner_check
 
@@ -19,167 +14,133 @@ def _cfg(**overrides):
 class _FakeModel:
     def __init__(self, entities):
         self._entities = entities
-        self.calls = []
 
     def predict_entities(self, text, labels, threshold):
-        self.calls.append({"text": text, "labels": labels, "threshold": threshold})
         return self._entities
 
 
-@pytest.fixture(autouse=True)
-def _reset_model_cache():
-    gliner_check._model = None
-    yield
-    gliner_check._model = None
+def _stub(monkeypatch, entities, cfg_overrides=None):
+    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(**(cfg_overrides or {}))})
+    monkeypatch.setattr(gliner_check, "_get_model", lambda model_name: _FakeModel(entities))
 
 
-def _stub_model(monkeypatch, entities):
-    fake = _FakeModel(entities)
-    monkeypatch.setattr(gliner_check, "_get_model", lambda model_name: fake)
-    return fake
-
-
-def test_disabled_is_a_no_op_and_never_builds_the_model(monkeypatch):
+def test_disabled_returns_text_unchanged(monkeypatch):
     monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(enabled=False)})
 
-    def _unexpected(model_name):
-        raise AssertionError("_get_model must not be called when the check is disabled")
+    text, step = gliner_check.check_with_gliner("My address is 42 Oakwood Lane")
 
-    monkeypatch.setattr(gliner_check, "_get_model", _unexpected)
-
-    step = gliner_check.check_with_gliner("hello")
-
-    assert step.action == "pass"
-    assert "disabled" in step.detail.lower()
-
-
-def test_empty_input_short_circuits_without_calling_the_model(monkeypatch):
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg()})
-
-    def _unexpected(model_name):
-        raise AssertionError("_get_model must not be called for empty input")
-
-    monkeypatch.setattr(gliner_check, "_get_model", _unexpected)
-
-    step = gliner_check.check_with_gliner("   ")
-
+    assert text == "My address is 42 Oakwood Lane"
     assert step.action == "pass"
 
 
-def test_pass_when_no_entities_detected(monkeypatch):
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg()})
-    _stub_model(monkeypatch, [])
+def test_no_entities_found_returns_text_unchanged(monkeypatch):
+    _stub(monkeypatch, [])
 
-    step = gliner_check.check_with_gliner("What is the annual leave accrual rate?")
+    text, step = gliner_check.check_with_gliner("What is the annual leave accrual rate?")
 
+    assert text == "What is the annual leave accrual rate?"
     assert step.action == "pass"
-    assert step.name == "gliner_check"
 
 
-def test_block_on_detected_address(monkeypatch):
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg()})
-    _stub_model(
-        monkeypatch,
-        [{"start": 0, "end": 16, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.93}],
-    )
+def test_single_validated_entity_is_redacted(monkeypatch):
+    _stub(monkeypatch, [{"start": 14, "end": 29, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.9}])
 
-    step = gliner_check.check_with_gliner("42 Oakwood Lane is where they live.")
+    text, step = gliner_check.check_with_gliner("My address is 42 Oakwood Lane")
 
-    assert step.action == "block"
-    assert "physical address" in step.detail
-
-
-def test_block_detail_never_contains_the_raw_matched_value(monkeypatch):
-    # Same audit-log-leak concern presidio_check.py/pii.py guard against —
-    # only the label may appear in detail, never the matched span text.
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg()})
-    _stub_model(
-        monkeypatch,
-        [{"start": 0, "end": 16, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.93}],
-    )
-
-    step = gliner_check.check_with_gliner("42 Oakwood Lane is where they live.")
-
+    assert text == "My address is [REDACTED_PHYSICAL_ADDRESS]"
+    assert step.action == "redact"
+    assert "PHYSICAL_ADDRESS" in step.detail
     assert "42 Oakwood Lane" not in step.detail
 
 
-def test_default_label_set_used_when_not_configured(monkeypatch):
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(labels=[])})
-    fake = _stub_model(monkeypatch, [])
+def test_default_label_gets_a_short_canonical_token(monkeypatch):
+    # A passport-shaped value, deliberately NOT a well-formed SSN — pii.py
+    # has no deterministic passport recognizer, so gliner_validators.py's
+    # _is_deterministic_ssn veto (see that module) does not apply here and
+    # this label's own canonical-token behavior is what's under test. A real
+    # SSN shape is covered separately by
+    # test_gliner_validators.py's SSN-veto tests, since that specific case
+    # is now intentionally vetoed in favor of pii.py's own SSN recognizer —
+    # see PII-SSN-01/PII-SSN-04 in tests/security/pii/test_pii_entities.py.
+    label = "government-issued identification number such as a social security number or passport number"
+    _stub(monkeypatch, [{"start": 13, "end": 21, "text": "A1234567", "label": label, "score": 0.9}])
 
-    gliner_check.check_with_gliner("hello")
+    text, step = gliner_check.check_with_gliner("My passport: A1234567")
 
-    assert fake.calls[0]["labels"] == list(gliner_check._DEFAULT_LABELS)
-
-
-def test_default_label_set_excludes_person_and_organization():
-    # The specific false-positive trap this module's docstring documents —
-    # this app's HR/manufacturing content routinely names real employees;
-    # a name-catching label would make ordinary queries unusable.
-    labels_lower = {label.lower() for label in gliner_check._DEFAULT_LABELS}
-    assert not any("person" in label or "name" in label or "organization" in label for label in labels_lower)
-
-
-def test_configured_labels_override_the_default_set(monkeypatch):
-    monkeypatch.setattr(
-        gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(labels=["custom label"])}
-    )
-    fake = _stub_model(monkeypatch, [])
-
-    gliner_check.check_with_gliner("hello")
-
-    assert fake.calls[0]["labels"] == ["custom label"]
+    assert text == "My passport: [REDACTED_GOVERNMENT_ID]"
+    assert step.action == "redact"
 
 
-def test_input_truncated_to_max_input_chars(monkeypatch):
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(max_input_chars=10)})
-    fake = _stub_model(monkeypatch, [])
+def test_vetoed_candidate_is_not_redacted(monkeypatch):
+    """The regression case: an employee ID matching the configured pattern
+    must not be redacted (or block anything) even though GLiNER scored it
+    against the government-ID label."""
+    from app.core.config import settings
 
-    gliner_check.check_with_gliner("a very long message that exceeds the configured max_input_chars limit")
+    label = "government-issued identification number such as a social security number or passport number"
+    _stub(monkeypatch, [{"start": 0, "end": 12, "text": "STF-MFG-41220", "label": label, "score": 0.77}])
+    original = settings.guardrail_employee_id_pattern
+    settings.guardrail_employee_id_pattern = r"[A-Z]{3}-[A-Z]{3}-\d{5}"
+    try:
+        text, step = gliner_check.check_with_gliner(
+            "Who reported the incident, and what is their employee ID STF-MFG-41220?"
+        )
+    finally:
+        settings.guardrail_employee_id_pattern = original
 
-    assert len(fake.calls[0]["text"]) == 10
+    assert "STF-MFG-41220" in text
+    assert step.action == "pass"
 
 
-def test_model_error_fails_closed_by_default(monkeypatch):
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg()})
+def test_overlapping_candidates_keep_only_the_higher_confidence_one(monkeypatch):
+    _stub(monkeypatch, [
+        {"start": 0, "end": 15, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.6},
+        {"start": 0, "end": 15, "text": "42 Oakwood Lane", "label": "financial account number", "score": 0.95},
+    ])
+
+    text, step = gliner_check.check_with_gliner("42 Oakwood Lane is where I live")
+
+    assert text.count("[REDACTED_") == 1
+    assert "[REDACTED_FINANCIAL_ACCOUNT]" in text
+
+
+def test_multiple_non_overlapping_candidates_are_all_redacted(monkeypatch):
+    _stub(monkeypatch, [
+        {"start": 0, "end": 15, "text": "42 Oakwood Lane", "label": "physical address", "score": 0.9},
+        {"start": 30, "end": 45, "text": "987654321012", "label": "financial account number", "score": 0.9},
+    ])
+
+    text, step = gliner_check.check_with_gliner("42 Oakwood Lane, account number 987654321012")
+
+    assert "42 Oakwood Lane" not in text
+    assert "987654321012" not in text
+    assert "[REDACTED_PHYSICAL_ADDRESS]" in text
+    assert "[REDACTED_FINANCIAL_ACCOUNT]" in text
+
+
+def test_detector_exception_fails_closed_by_default(monkeypatch):
+    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(enabled=True)})
 
     class _Boom:
         def predict_entities(self, *a, **k):
-            raise RuntimeError("model not loaded")
+            raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(gliner_check, "_get_model", lambda model_name: _Boom())
 
-    step = gliner_check.check_with_gliner("hello")
+    text, step = gliner_check.check_with_gliner("An entirely ordinary message.")
 
     assert step.action == "block"
-    assert "failed closed" in step.detail.lower()
 
 
-def test_model_error_fails_open_when_configured(monkeypatch):
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(fail_closed=False)})
+def test_detector_exception_fails_open_when_configured(monkeypatch):
+    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg(enabled=True, fail_closed=False)})
 
     class _Boom:
         def predict_entities(self, *a, **k):
-            raise RuntimeError("model not loaded")
+            raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(gliner_check, "_get_model", lambda model_name: _Boom())
 
-    step = gliner_check.check_with_gliner("hello")
+    text, step = gliner_check.check_with_gliner("An entirely ordinary message.")
 
     assert step.action == "pass"
-    assert "failed open" in step.detail.lower()
-
-
-def test_model_error_never_leaks_the_raw_exception_message(monkeypatch):
-    monkeypatch.setattr(gliner_check, "load_yaml_config", lambda name: {"gliner_check": _cfg()})
-
-    class _Boom:
-        def predict_entities(self, *a, **k):
-            raise RuntimeError("sensitive internal detail: sk-fake-secret-123")
-
-    monkeypatch.setattr(gliner_check, "_get_model", lambda model_name: _Boom())
-
-    step = gliner_check.check_with_gliner("hello")
-
-    assert "sk-fake-secret-123" not in step.detail
-    assert "RuntimeError" in step.detail

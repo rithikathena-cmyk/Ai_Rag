@@ -29,6 +29,24 @@ def test_is_valid_phone_rejects_short_numbers():
         assert v.is_valid_phone(bad) is False, bad
 
 
+def test_is_valid_phone_accepts_nanp_local_format():
+    """A bare NANP local number (3-digit exchange + 4-digit subscriber, no
+    area code) is 7 digits — shorter than every other accepted length. This
+    is a STRUCTURAL acceptance only: pii.py's PHONE recognizer additionally
+    requires phone_confidence() != "low" before actually redacting (see
+    test_pii_patterns.py's NANP-local section for the end-to-end behavior a
+    bare, context-free 7-digit run stays unredacted despite passing here)."""
+    assert v.is_valid_phone("5550199") is True
+    assert v.is_valid_phone("555-0199") is True
+
+
+def test_is_valid_phone_still_rejects_six_and_eight_digit_runs():
+    """7 is the one new accepted length — this must not silently widen into
+    a general "anything close to 7" acceptance."""
+    assert v.is_valid_phone("555019") is False
+    assert v.is_valid_phone("55501990") is False
+
+
 def test_canonicalize_phone_unifies_indian_formats():
     canon = v.canonicalize_phone("9876543210")
     assert v.canonicalize_phone("+91 9876543210") == canon

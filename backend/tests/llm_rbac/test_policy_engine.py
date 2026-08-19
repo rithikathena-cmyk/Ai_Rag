@@ -129,9 +129,16 @@ def test_hr_and_project_manager_model_access_is_not_identical():
 
 # ------------------------------------------------------- coarse rbac_permissions
 
-def test_employee_granted_permissions_is_chat_only():
+def test_employee_granted_permissions_is_chat_and_readonly_analytics():
+    # VIEW_ANALYTICS is deliberately org-wide (every role holds it) so the
+    # read-only Metrics dashboards — latency/tokens, retrieval, gateway cost,
+    # guardrail counts — are visible to everyone. Employee still gets NO
+    # document, user, role, audit, or admin permission; and the raw guardrail
+    # `detail` strings behind those counts stay gated on VIEW_AUDIT_LOGS,
+    # which Employee does not hold (see
+    # test_employee_cannot_see_raw_guardrail_detail in test_permission_matrix).
     cfg = policy_loader.role_config("user")
-    assert cfg.granted_permissions == frozenset({"CHAT", "VIEW_CONVERSATIONS"})
+    assert cfg.granted_permissions == frozenset({"CHAT", "VIEW_CONVERSATIONS", "VIEW_ANALYTICS"})
 
 
 def test_hr_and_project_manager_get_document_and_analytics_but_not_admin_permissions():
@@ -172,6 +179,16 @@ def test_ceo_granted_permissions_excludes_manage_users_manage_roles_and_settings
         # CEO decides employee-PII approval requests unscoped — see
         # docs/GUARDRAILS_ARCHITECTURE.md §14.
         "MANAGE_EMPLOYEE_PII",
+        # CEO is an explicit co-approver (alongside Admin) for the Guardrail
+        # Policy Center specifically — a dedicated permission, not
+        # SYSTEM_SETTINGS, which CEO is still excluded from below. See
+        # core/permissions.py's comment on MANAGE_GUARDRAIL_POLICIES.
+        "MANAGE_GUARDRAIL_POLICIES",
+        # Policy Copilot, granted alongside MANAGE_GUARDRAIL_POLICIES so
+        # CEO's effective authority is unchanged. Split into four so a
+        # deployment can require separate proposers and approvers without a
+        # code change — see core/permissions.py.
+        "POLICY_READ", "POLICY_SIMULATE", "POLICY_PROPOSE", "POLICY_APPROVE",
     })
     assert "MANAGE_USERS" not in cfg.granted_permissions
     assert "MANAGE_ROLES" not in cfg.granted_permissions

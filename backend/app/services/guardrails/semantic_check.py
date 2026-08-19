@@ -20,6 +20,7 @@ an LLM-judge catch-all.
 
 from app.core.yaml_config import load_yaml_config
 from app.services.embedding.similarity import MaxSimilarityMatcher
+from app.services.guardrail_policy import store as policy_store
 from app.services.guardrails.types import GuardrailStep
 
 NAME = "semantic_risk_check"
@@ -99,8 +100,26 @@ _UNSAFE_EXAMPLES = (
 _matcher = MaxSimilarityMatcher(_UNSAFE_EXAMPLES)
 
 
+_POLICY_KEY = "semantic.risk_threshold"
+
+
 def _config() -> dict:
-    return load_yaml_config("guardrails.yaml").get("semantic_check", {})
+    """Falls back to guardrails.yaml exactly as before this pass when no
+    admin has created a "semantic.risk_threshold" policy row — see
+    guardrail_policy/store.py's module docstring on why a missing/
+    unreachable policy store always means "use the existing default," never
+    "allow everything." An override row's `enabled` flag is honored even
+    when False (Guardrail Policy Center's own on/off toggle), which is why
+    this reads get_policy() (any row) rather than get_active_policies()
+    (enabled rows only) — see get_policy()'s own docstring for that
+    distinction."""
+    cfg = dict(load_yaml_config("guardrails.yaml").get("semantic_check", {}))
+    override = policy_store.get_policy(_POLICY_KEY)
+    if override is not None and override.mode == "ENFORCE":
+        cfg["enabled"] = override.enabled
+        if "threshold" in override.configuration:
+            cfg["threshold"] = override.configuration["threshold"]
+    return cfg
 
 
 def check_semantic_risk(text: str) -> GuardrailStep:

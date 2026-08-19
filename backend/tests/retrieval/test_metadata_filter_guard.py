@@ -54,7 +54,7 @@ def test_user_id_only_does_not_raise(monkeypatch):
     doc_ids = [uuid.uuid4()]
     monkeypatch.setattr(
         "app.services.retrieval.metadata_filter.filter_by_permission",
-        lambda db, ids, user_id: ids,
+        lambda db, ids, user_id, role=None: ids,
     )
     result = resolve_document_ids(_FakeDb(doc_ids), user_id=uuid.uuid4())
     assert set(result) == set(doc_ids)

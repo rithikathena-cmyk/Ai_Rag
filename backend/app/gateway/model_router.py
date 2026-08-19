@@ -2,8 +2,10 @@ from app.core.yaml_config import load_yaml_config
 from app.gateway.schemas import ModelTier, ModelTierConfig
 
 _DEFAULTS: dict[str, dict] = {
+    # Mirrors config/models.yaml: no tier resolves to an Opus model. Kept in
+    # sync manually — this is only the fallback used if that file is missing
+    # or partial (see resolve()'s docstring).
     "tiers": {
-        "fast": {"model": "claude-opus-5", "max_tokens": 4096, "effort": "medium"},
         # supports_extended_reasoning: False — verified live, claude-haiku-4-5
         # rejects both thinking={"type": "adaptive"} and output_config=
         # {"effort": ...} with a 400 invalid_request_error. This is the tier
@@ -11,10 +13,11 @@ _DEFAULTS: dict[str, dict] = {
         # tiers_allowed: [haiku]), so without this, every Employee chat turn
         # fails and silently degrades to the raw-search fallback — see
         # gateway/schemas.py::ModelTierConfig's own comment.
+        "fast": {"model": "claude-haiku-4-5-20251001", "max_tokens": 4096, "effort": "medium", "supports_extended_reasoning": False},
         "haiku": {"model": "claude-haiku-4-5-20251001", "max_tokens": 4096, "effort": "medium", "supports_extended_reasoning": False},
         "sonnet": {"model": "claude-sonnet-5", "max_tokens": 4096, "effort": "medium"},
-        "reasoning": {"model": "claude-opus-5", "max_tokens": 4096, "effort": "high"},
-        "opus": {"model": "claude-opus-5", "max_tokens": 4096, "effort": "high"},
+        "reasoning": {"model": "claude-sonnet-5", "max_tokens": 4096, "effort": "high"},
+        "opus": {"model": "claude-sonnet-5", "max_tokens": 4096, "effort": "high"},
     },
     "default_tier": "fast",
 }

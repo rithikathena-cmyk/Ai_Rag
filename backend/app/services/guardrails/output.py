@@ -2,6 +2,7 @@ import re
 
 from app.core.config import settings
 from app.services.agents.planner import PLANNER_SYSTEM_PROMPT
+from app.services.guardrails.secrets import CREDENTIAL_PATTERNS
 from app.services.guardrails.types import GuardrailStep
 
 NAME = "system_prompt_leak_check"
@@ -21,27 +22,11 @@ _MARKERS = (PLANNER_SYSTEM_PROMPT.split(".")[0].strip(),) + tuple(
 # catch the reply exposing a real secret value regardless of where it came
 # from (an env var, a config file the model was never supposed to quote, a
 # credential accidentally embedded in an ingested document that got echoed
-# back verbatim, ...). Deliberately shape-based (looks like an actual
-# populated secret), not keyword-based ("API key" as a bare phrase) — a
-# reply that mentions "set your API key in the .env file" as generic advice
-# is not a leak and must not block; a reply containing what looks like a
-# real key value is. A generic secrets scan, not specific to any one
-# provider — covers the credential shapes most likely to end up embedded in
-# a config file, README, or support ticket this app might ingest and later
-# quote back.
-_CREDENTIAL_PATTERNS = tuple(
-    re.compile(p)
-    for p in (
-        r"\bsk-[A-Za-z0-9_-]{20,}\b",  # Anthropic/OpenAI-style secret key
-        r"\bAKIA[A-Z0-9]{16}\b",  # AWS access key id
-        r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",  # JWT-shaped (header.payload.signature)
-        r"\bgh[pousr]_[A-Za-z0-9]{36,}\b",  # GitHub personal access / OAuth / app token
-        r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",  # Slack bot/user/app token
-        r"\bAIza[0-9A-Za-z_-]{35}\b",  # Google API key
-        r"\bsk_live_[0-9a-zA-Z]{24,}\b",  # Stripe live secret key
-        r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----",  # PEM private key block
-    )
-)
+# back verbatim, ...). Shared with services/guardrails/secrets.py's
+# input-side check_secrets() — same shapes, same "must not block generic
+# advice, must block an actual value" reasoning, now defined once instead of
+# twice. See that module's docstring for the full rationale.
+_CREDENTIAL_PATTERNS = CREDENTIAL_PATTERNS
 
 # Generic leak-framing phrases — distinct from _MARKERS (verbatim echo of
 # THIS app's actual prompt text) and _CREDENTIAL_PATTERNS (a real secret
@@ -72,10 +57,9 @@ def check_system_prompt_leak(text: str) -> GuardrailStep:
         if marker and marker.lower() in lowered:
             return GuardrailStep(NAME, "block", f"Reply contains system prompt fragment: {marker!r}")
 
-    for pattern in _CREDENTIAL_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            return GuardrailStep(NAME, "block", f"Reply contains a credential-shaped value ({pattern.pattern})")
+    for label, pattern in _CREDENTIAL_PATTERNS:
+        if pattern.search(text):
+            return GuardrailStep(NAME, "block", f"Reply contains a credential-shaped value: {label}")
 
     match = _LEAK_FRAMING_RE.search(text)
     if match:

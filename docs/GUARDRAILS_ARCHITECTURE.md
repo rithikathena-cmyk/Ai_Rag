@@ -281,10 +281,17 @@ version's cost/quota concerns, which don't apply to a local model.
 — both mock `presidio_check._get_analyzer()` directly (not the real spaCy model) so the suite stays
 fast, matching this package's established convention of stubbing the I/O/model boundary.
 
-## 11. PII: hash mode, and input PII now blocks by default
+## 11. PII: hash mode, and the uniform two-tier PII policy
 
 Two independent, user-requested changes to `services/guardrails/pii.py`/`pipeline.py`, both
 configurable rather than hardcoded.
+
+> A policy row can now also carry a partial-mask length (`reveal_last`) and
+> per-role exceptions (`role_overrides`), so "mask phone numbers, show the last
+> four digits, HR sees the whole number" is a single row rather than a wish.
+> See **[PII_ROLE_POLICY.md](PII_ROLE_POLICY.md)** — including the limitation
+> that role exceptions reach only the deterministic recognizers, not spans
+> GLiNER or Presidio claim first.
 
 **Hash mode** (`Settings.guardrail_pii_mode`, `"placeholder"` | `"hash"`, default `"placeholder"` —
 unchanged behavior unless opted in): `"placeholder"` is the original fixed `[REDACTED_EMAIL]`-style
@@ -297,15 +304,42 @@ always redacts to the same token within one deployment (useful for correlating "
 twice" without ever storing or exposing the real value), and a different salt produces different tokens
 for the same value (verified directly — `tests/guardrails/test_pii.py`).
 
-**Input PII now blocks by default** (`Settings.guardrail_pii_block_input`, default `True`) —
-`run_input_guardrails()` (`pipeline.py`) treats a `redact_pii()` match on the *user's own message* as a
-block, the same short-circuit every other input check already gets, rather than redacting and letting
-the (redacted) message continue to Claude. Rationale: for input, the user is the source of the PII —
-there's no "the model already generated it, redaction is what's left to do" argument the output side
-has. Set the flag to `False` to restore the original redact-and-continue behavior. **Output PII is
-never blocked, only ever redacted, regardless of this flag** — `run_output_guardrails()` doesn't read
-it at all — because by the time Claude's reply exists, blocking it outright would just be a worse
-version of redacting it.
+**Input PII is masked and the request continues** (`Settings.guardrail_pii_block_input`, now default
+`False`). When the flag is `True`, `run_input_guardrails()` (`pipeline.py`) instead treats a
+`redact_pii()` match on the *user's own message* as a block, the same short-circuit every other input
+check gets.
+
+The default was flipped alongside the uniform PII policy below. The two are not independent:
+`_resolve_match()` reports a `MASK` action as status `"redact"`, and the flag blocks on `"redact"` —
+so leaving it `True` would convert every masked identifier straight back into a hard block and the
+`MASK` tier would be unreachable in practice. Credentials are unaffected either way: they resolve to
+`BLOCK`, which this flag does not govern.
+
+**Output PII is never blocked by this flag, only ever redacted** — `run_output_guardrails()` doesn't
+read it at all — because by the time Claude's reply exists, blocking it outright would just be a worse
+version of redacting it. (An output-side `BLOCK` is still reachable via an explicit per-entity policy
+row; it just isn't a default.)
+
+### Uniform PII policy — two tiers
+
+`services/guardrail_policy/pii_policy.py` resolves every entity into one of exactly two tiers, so an
+entity's treatment is predictable without consulting a per-type table:
+
+| Tier | Entities | Input | Output |
+| --- | --- | --- | --- |
+| Personal data | `SSN`, `PAN`, `AADHAAR`, `PASSPORT`, `BANK_ACCOUNT`, `CREDIT_CARD`, `PHONE`, `EMAIL`, and anything unlisted | `MASK` | `REDACT` |
+| Credentials | `API_KEY`, `PASSWORD`, `ACCESS_TOKEN`, `SECRET` | `BLOCK` | `BLOCK` |
+
+This replaced a three-way split that treated near-identical types inconsistently — `SSN` redacted
+while `CREDIT_CARD` blocked, and `PHONE`/`EMAIL` merely `FLAG`ged, meaning two of the most commonly
+pasted identifiers got the weakest treatment of all (detected, logged, then left in the text
+verbatim). Credentials stay `BLOCK` because they are not personal data with a legitimate reason to
+appear in a question: masking an API key still leaves it in the request reaching the model, so
+refusing is the only useful response.
+
+Both tiers are defaults, not fixed policy — a CEO/Admin can override any single entity in either
+direction from the Guardrail Policy Center (`/guardrail-policies`), and an entity with an explicit
+row always wins over the table above.
 
 **Block reason never echoes the matched value**: `pii_step.detail` (e.g. `"Redacted: EMAIL
 'jane@example.com'"`) is deliberately never used as the user-facing block reason — a fixed, generic
@@ -317,9 +351,9 @@ did leak the matched value, fixed before merge.
 
 **Tests**: `tests/guardrails/test_pii.py` (9 — placeholder/hash mode, consistency, salt sensitivity, all
 four PII types in hash mode, disabled-check passthrough, unknown-mode fallback) and
-`tests/guardrails/test_pipeline_pii_block.py` (6 — blocks by default, reason never leaks the value,
-clean input unaffected, flag-off restores old behavior, output never blocks regardless of the flag,
-the `pii_redact` step still appears in the trace even when blocking). `gateway/demo/test_policy.py`/
+`tests/guardrails/test_pipeline_pii_block.py` (6 — personal identifiers masked on input, SSN
+redacted rather than blocked on output, reason never leaks the value, clean input unaffected,
+flag-on restores blocking, the `pii_redact` step still appears in the trace even when blocking). `gateway/demo/test_policy.py`/
 `test_gateway.py` updated for the new default (2 tests replaced with 4 covering both the new default
 and the flag-off case).
 

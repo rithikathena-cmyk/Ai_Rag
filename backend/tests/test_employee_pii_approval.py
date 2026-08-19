@@ -70,10 +70,15 @@ class _FakeSession:
             return self._record if self._record is not None and id_ == self._record.id else None
         return None
 
-    def query(self, model):
-        if model is EmployeePIIRecordModel and self._record is not None:
+    def query(self, model, *more):
+        # *more: routers/approvals.py's _resolve_emails() does a
+        # multi-column db.query(UserModel.id, UserModel.email) select — this
+        # fixture has no user rows to resolve emails for regardless, so
+        # every multi-column call is safe to fall through to the same empty
+        # result the single-column "unknown model" case already returns.
+        if not more and model is EmployeePIIRecordModel and self._record is not None:
             return _FakeQuery([self._record])
-        if model is ApprovalRequestModel and self._approval is not None:
+        if not more and model is ApprovalRequestModel and self._approval is not None:
             return _FakeQuery([self._approval])
         return _FakeQuery([])
 
@@ -107,7 +112,10 @@ def _build_app(approval, record, role: str, department: str = "hr", requester_id
     app.include_router(approvals.router)
     fake_db = _FakeSession(approval, record)
     app.dependency_overrides[get_db] = lambda: fake_db
-    fake_user = SimpleNamespace(id=requester_id or uuid.uuid4(), role=role, department=department, is_active=True)
+    fake_user = SimpleNamespace(
+        id=requester_id or uuid.uuid4(), role=role, department=department, is_active=True,
+        email=f"{role}@example.com",
+    )
     app.dependency_overrides[get_current_user] = lambda: fake_user
     return TestClient(app), fake_db, fake_user
 

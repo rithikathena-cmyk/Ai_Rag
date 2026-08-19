@@ -27,7 +27,15 @@ def judge_answer(question: str, answer: str, sources: list[str], *, request_id: 
                 agent_name="eval_judge",
                 system=JUDGE_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_message}],
-                tier=ModelTier.FAST,
+                # REASONING, not FAST: this call's whole job is judgment
+                # quality (grading a generated answer against its sources),
+                # unlike this module's siblings (router classification, memory
+                # summarization, query rewrite) where FAST's speed is the
+                # point. FAST was riding on being aliased to Opus before the
+                # tier table was repointed off Opus (see config/models.yaml's
+                # header) — an unintentional quality dependency that would
+                # otherwise have silently downgraded eval scoring to Haiku.
+                tier=ModelTier.REASONING,
                 max_tokens=500,
                 request_id=request_id,
                 cache_system=True,

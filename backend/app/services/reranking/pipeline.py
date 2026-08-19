@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.services.guardrails.pii import DualText
+from app.services.guardrails.secrets import redact_secrets
 from app.services.monitoring.metrics import record_retrieval_error, record_retrieval_metrics
 from app.services.reranking.reranker import rerank
 from app.services.retrieval.search import SearchHit, hybrid_search
@@ -96,6 +97,17 @@ def search_with_reranking(
     # SearchHit objects (dataclasses.replace) rather than mutating in place —
     # `text` on the object hybrid_search/rerank produced is left exactly as
     # it was; only the returned copy gains a populated display_text.
+    #
+    # Secrets are redacted from BOTH `text` and `display_text` — stricter
+    # than the PII split above. A document a user is genuinely authorized to
+    # retrieve can still happen to contain a real embedded credential (a
+    # config file or support ticket that got ingested); there's no
+    # legitimate case for a live credential value reaching the LLM's context
+    # OR a citation, unlike PII's authorized-lookup case (see
+    # secrets.py::redact_secrets()'s docstring). Applied before the PII pass
+    # populates display_text so a secret matched here doesn't also need a
+    # second, redundant PII-side scan.
+    hits = [dataclasses.replace(h, text=redact_secrets(h.text)[0]) for h in hits]
     hits = [dataclasses.replace(h, display_text=DualText.from_raw(h.text).display) for h in hits]
 
     return hits, reranked

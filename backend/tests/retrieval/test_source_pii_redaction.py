@@ -218,3 +218,45 @@ def test_reranker_sees_real_text_not_redacted_text(monkeypatch):
     assert seen_by_reranker["display_text"] == ""  # display_text doesn't exist yet at rerank time
     assert result_hits[0].text == "email jane@example.com"  # LLM-facing content unchanged
     assert "jane@example.com" not in result_hits[0].display_text  # display view is redacted
+
+
+# --------------------------------------------------- secret redaction (both text AND display_text)
+#
+# Found during the guardrails audit: a document a user is genuinely
+# authorized to retrieve can still contain a real embedded credential (an
+# ingested config file, README, or support ticket) — pii.py's recognizers
+# have no coverage for credential shapes (API keys, AWS keys, JWTs, private
+# keys) at all, so before this fix such a value flowed into BOTH the LLM's
+# context (`.text`) and the user-facing citation (`.display_text`)
+# unredacted. Unlike PII, secrets are redacted from `.text` too — see
+# services/guardrails/secrets.py::redact_secrets()'s docstring for why
+# there's no equivalent "authorized lookup" case for a live credential.
+
+
+def test_secret_in_source_is_redacted_in_both_text_and_display_text(monkeypatch):
+    hits, _ = _run(monkeypatch, [_hit("Deploy key: AKIAABCDEFGHIJKLMNOP for the staging bucket.")])
+
+    assert "AKIAABCDEFGHIJKLMNOP" not in hits[0].text
+    assert "AKIAABCDEFGHIJKLMNOP" not in hits[0].display_text
+    assert "[REDACTED_SECRET]" in hits[0].text
+    assert "[REDACTED_SECRET]" in hits[0].display_text
+
+
+def test_secret_and_pii_in_the_same_source_are_both_redacted(monkeypatch):
+    settings.guardrail_redact_pii = True
+    settings.guardrail_pii_mode = "placeholder"
+    hits, _ = _run(
+        monkeypatch,
+        [_hit("Contact jane@example.com. Legacy key AKIAABCDEFGHIJKLMNOP still active.")],
+    )
+
+    assert "AKIAABCDEFGHIJKLMNOP" not in hits[0].text
+    assert "[REDACTED_SECRET]" in hits[0].text
+    assert "jane@example.com" not in hits[0].display_text
+    assert "[REDACTED_EMAIL]" in hits[0].display_text
+
+
+def test_non_secret_source_text_is_unchanged(monkeypatch):
+    hits, _ = _run(monkeypatch, [_hit("What is the annual leave accrual rate for full-time staff?")])
+
+    assert hits[0].text == "What is the annual leave accrual rate for full-time staff?"

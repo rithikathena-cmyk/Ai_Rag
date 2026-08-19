@@ -1,7 +1,6 @@
 import logging
 import time
 import uuid
-from contextvars import ContextVar
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
@@ -10,19 +9,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
+from app.core.request_context import request_id_ctx
 from app.routers import (
-    auth, health, chat, documents, terms, users, upload_logs, search, reports, conversations, admin, evaluation,
-    projects, approvals,
+    audit, auth, health, chat, documents, terms, users, upload_logs, search, reports, conversations, admin,
+    evaluation, projects, approvals, guardrail_policies, policy_copilot, traces, pii_access,
 )
 from app.services.monitoring.metrics import record_latency
 
-# Request-id correlation for logs — a ContextVar so any logger.*() call
-# anywhere in the request's call stack picks it up for free via the filter
-# below, without threading a request_id param through every function that
-# only ever logs (functions that need it for durable records — metrics,
-# audit log — still take it as an explicit param since those outlive the
-# request-scoped contextvar; see services/retrieval/search.py).
-_request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+# Request-id correlation for logs — a ContextVar (app/core/request_context.py,
+# shared with service-layer code that can't import this module — see that
+# module's docstring) so any logger.*() call anywhere in the request's call
+# stack picks it up for free via the filter below, without threading a
+# request_id param through every function that only ever logs (functions
+# that need it for durable records — metrics, audit log — still take it as
+# an explicit param since those outlive the request-scoped contextvar; see
+# services/retrieval/search.py).
+_request_id_ctx = request_id_ctx
 
 
 class _RequestIdFilter(logging.Filter):
@@ -67,6 +69,11 @@ app.include_router(admin.router)
 app.include_router(evaluation.router)
 app.include_router(projects.router)
 app.include_router(approvals.router)
+app.include_router(audit.router)
+app.include_router(guardrail_policies.router)
+app.include_router(policy_copilot.router)
+app.include_router(traces.router)
+app.include_router(pii_access.router)
 
 
 @app.middleware("http")

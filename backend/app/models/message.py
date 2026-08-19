@@ -19,6 +19,12 @@ class MessageModel(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     sources: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     report: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Safe execution trace (routers/chat.py's ChatTraceStep list, serialized)
+    # for the user-facing Security & Activity panel — only ever set on the
+    # assistant reply, never the user's own message. Null for any message
+    # persisted before this column existed; the frontend simply doesn't show
+    # the panel for those rather than fabricating one.
+    trace: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True

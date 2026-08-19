@@ -28,6 +28,7 @@ concern from the other direction.
 import threading
 
 from app.core.yaml_config import load_yaml_config
+from app.services.guardrail_policy import store as policy_store
 from app.services.guardrails.types import GuardrailStep
 
 NAME = "deberta_injection_check"
@@ -55,8 +56,21 @@ def _get_pipeline(model_name: str):
     return _pipeline
 
 
+_POLICY_KEY = "prompt_injection.risk_threshold"
+
+
 def _config() -> dict:
-    return load_yaml_config("guardrails.yaml").get("deberta_injection_check", {})
+    """Same DB-override-with-YAML-fallback pattern as semantic_check.py's
+    _config() — see that module's comment for the enabled/threshold
+    precedence rules and why a missing/unreachable policy store is always
+    the safe direction."""
+    cfg = dict(load_yaml_config("guardrails.yaml").get("deberta_injection_check", {}))
+    override = policy_store.get_policy(_POLICY_KEY)
+    if override is not None and override.mode == "ENFORCE":
+        cfg["enabled"] = override.enabled
+        if "threshold" in override.configuration:
+            cfg["score_threshold"] = override.configuration["threshold"]
+    return cfg
 
 
 def check_with_deberta(text: str) -> GuardrailStep:

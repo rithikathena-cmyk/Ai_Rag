@@ -1,8 +1,8 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
@@ -32,6 +32,7 @@ class ConversationSummary(BaseModel):
     user_id: uuid.UUID | None
     title: str | None
     message_count: int
+    pinned_at: datetime | None
     created_at: datetime
     updated_at: datetime | None
 
@@ -47,6 +48,7 @@ class MessageResponse(BaseModel):
     content: str
     sources: list[dict] | None
     report: dict | None
+    trace: list[dict] | None
     created_at: datetime
 
 
@@ -61,6 +63,7 @@ def _to_summary(row: ConversationModel) -> ConversationSummary:
         user_id=row.user_id,
         title=row.title,
         message_count=row.message_count,
+        pinned_at=row.pinned_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -80,7 +83,9 @@ def list_conversations(
     query = db.query(ConversationModel)
     if user_id is not None:
         query = query.filter(ConversationModel.user_id == user_id)
-    query = query.order_by(ConversationModel.created_at.desc())
+    # Pinned conversations float to the top (most-recently-pinned first),
+    # unpinned ones below sorted by recency — same list, no separate endpoint.
+    query = query.order_by(ConversationModel.pinned_at.is_(None), ConversationModel.pinned_at.desc(), ConversationModel.created_at.desc())
     total = query.count()
     rows = query.offset(offset).limit(limit).all()
     return ConversationListResponse(items=[_to_summary(r) for r in rows], total=total)
@@ -102,7 +107,8 @@ def get_conversation_detail(
         summary=row.summary,
         messages=[
             MessageResponse(
-                id=m.id, role=m.role, content=m.content, sources=m.sources, report=m.report, created_at=m.created_at
+                id=m.id, role=m.role, content=m.content, sources=m.sources, report=m.report, trace=m.trace,
+                created_at=m.created_at,
             )
             for m in messages
         ],
@@ -120,3 +126,32 @@ def delete_conversation(
     authorize_conversation_access(row, current_user)
     db.delete(row)
     db.commit()
+
+
+class ConversationUpdateRequest(BaseModel):
+    # PATCH semantics: a field is only changed when the caller actually sends
+    # it (Pydantic v2 "unset" check below), not merely by being present with
+    # a value — so a rename-only request can't accidentally unpin, and a
+    # pin-only request can't accidentally clear the title.
+    title: str | None = Field(default=None, max_length=256)
+    pinned: bool | None = None
+
+
+@router.patch("/conversations/{conversation_id}", response_model=ConversationSummary)
+def update_conversation(
+    conversation_id: uuid.UUID, body: ConversationUpdateRequest, db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user),
+):
+    row = get_conversation(db, conversation_id)
+    if row is None:
+        raise AppError(404, "conversation_not_found", f"Conversation {conversation_id} not found")
+    authorize_conversation_access(row, current_user)
+
+    fields = body.model_fields_set
+    if "title" in fields:
+        row.title = body.title
+    if "pinned" in fields:
+        row.pinned_at = datetime.now(timezone.utc) if body.pinned else None
+    db.commit()
+    db.refresh(row)
+    return _to_summary(row)

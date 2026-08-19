@@ -92,10 +92,18 @@ roles:
       max_concurrent_requests: 2
     approval_required_actions: []
     # Coarse permission catalog (see file-header comment above) — Employee
-    # gets the chatbot and nothing else; no document/analytics/admin access.
+    # gets the chatbot plus the read-only operational Metrics dashboards
+    # (latency/tokens, retrieval, gateway cost, guardrail counts); still no
+    # document or admin access. VIEW_ANALYTICS is now held by every role, so
+    # the platform's own health and spend are visible org-wide; the one piece
+    # deliberately NOT widened is each guardrail event's raw `detail` string,
+    # which routers/admin.py::get_guardrail_analytics() redacts for roles
+    # without VIEW_AUDIT_LOGS because it embeds classifier scores and
+    # configured deny-keywords.
     rbac_permissions:
       - CHAT
       - VIEW_CONVERSATIONS
+      - VIEW_ANALYTICS
     # Report-type catalog (docs/USER_WISE_REPORT_RBAC.md) — distinct from
     # `permissions` above: this names report *artifacts* a role may request,
     # not general capabilities. machine_status/shift_report/production_summary/
@@ -381,6 +389,19 @@ roles:
       - VIEW_USERS
       - VIEW_ROLES
       - VIEW_AUDIT_LOGS
+      # Guardrail Policy Center — CEO is an explicit co-approver alongside
+      # Admin for this feature (not gated by SYSTEM_SETTINGS, which CEO is
+      # otherwise excluded from — see core/permissions.py's own comment on
+      # MANAGE_GUARDRAIL_POLICIES for why this is a dedicated permission).
+      - MANAGE_GUARDRAIL_POLICIES
+      # Policy Copilot. Granted alongside MANAGE_GUARDRAIL_POLICIES so this
+      # role's authority is unchanged in practice, but split so a future
+      # deployment can require separate proposers and approvers without a
+      # code change.
+      - POLICY_READ
+      - POLICY_SIMULATE
+      - POLICY_PROPOSE
+      - POLICY_APPROVE
     reports:
       allowed: ["*"]
 
@@ -430,6 +451,21 @@ roles:
       # Admin decides employee-PII approval requests unscoped — see
       # docs/GUARDRAILS_ARCHITECTURE.md §14.
       - MANAGE_EMPLOYEE_PII
+      - MANAGE_GUARDRAIL_POLICIES
+      # Policy Copilot. Granted alongside MANAGE_GUARDRAIL_POLICIES so this
+      # role's authority is unchanged in practice, but split so a future
+      # deployment can require separate proposers and approvers without a
+      # code change.
+      - POLICY_READ
+      - POLICY_SIMULATE
+      - POLICY_PROPOSE
+      - POLICY_APPROVE
+      # Reveal original PII values in the Security & Activity / Traces
+      # view (core/permissions.py::Permission.PII_VIEW_RAW). Admin-only by
+      # default; every other role (including CEO) is false by default and
+      # must be granted this explicitly, in this same list, if a
+      # deployment wants it — never implied by another permission.
+      - PII_VIEW_RAW
     # Covers both CEO's full report catalog (executive_report, project_portfolio,
     # production, maintenance, quality, inventory, warehouse, procurement, hr,
     # workforce, enterprise, risk, management_summary, ...) and Admin's own

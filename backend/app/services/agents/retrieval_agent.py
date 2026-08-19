@@ -44,7 +44,13 @@ def search_documents(
         return []
 
     doc_ids = {h.document_id for h in hits}
-    filenames = {r[0]: r[1] for r in db.query(DocumentModel.id, DocumentModel.filename).filter(DocumentModel.id.in_(doc_ids)).all()}
+    doc_meta = {
+        r.id: r
+        for r in db.query(
+            DocumentModel.id, DocumentModel.filename, DocumentModel.department,
+            DocumentModel.document_type, DocumentModel.security_classification,
+        ).filter(DocumentModel.id.in_(doc_ids)).all()
+    }
 
     # Phase 3A — parent-child retrieval (docs/RAG_RETRIEVAL.md): attaches
     # broader parent-section context to a precisely-matched child chunk
@@ -78,10 +84,19 @@ def search_documents(
     # mirrors.
     results = []
     for h in hits:
+        meta = doc_meta.get(h.document_id)
         item = {
             "chunk_id": str(h.chunk_id),
             "document_id": str(h.document_id),
-            "document_filename": filenames.get(h.document_id),
+            "document_filename": meta.filename if meta else None,
+            # Document-level metadata, not chunk content — safe to surface
+            # alongside a citation the caller already RBAC-cleared to
+            # retrieve (this function's own department/permission filters
+            # already ran above); the chat UI's source panel uses this for
+            # its "Department / Document type / Security level" display.
+            "document_department": meta.department if meta else None,
+            "document_type": meta.document_type if meta else None,
+            "security_classification": meta.security_classification if meta else None,
             "chunk_index": h.chunk_index,
             "text": h.text,
             "display_text": h.display_text,

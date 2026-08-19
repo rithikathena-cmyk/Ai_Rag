@@ -12,6 +12,7 @@ LLM-vs-public source tests there).
 """
 
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,16 +31,22 @@ def _hit(chunk_id=None, parent_chunk_id=None, text="child text") -> SearchHit:
 
 
 class _FakeFilenameQuery:
+    def __init__(self, rows=()):
+        self._rows = rows
+
     def filter(self, *a, **k):
         return self
 
     def all(self):
-        return []
+        return self._rows
 
 
 class _FakeDb:
+    def __init__(self, doc_meta_rows=()):
+        self._doc_meta_rows = doc_meta_rows
+
     def query(self, *a, **k):
-        return _FakeFilenameQuery()
+        return _FakeFilenameQuery(self._doc_meta_rows)
 
 
 def test_parent_context_attached_when_enabled_and_present(monkeypatch):
@@ -110,8 +117,44 @@ def test_disabled_mode_output_shape_matches_pre_phase3a_contract(monkeypatch):
     results = retrieval_agent.search_documents(_FakeDb(), query="q")
 
     assert set(results[0].keys()) == {
-        "chunk_id", "document_id", "document_filename", "chunk_index", "text", "display_text", "score",
+        "chunk_id", "document_id", "document_filename", "document_department", "document_type",
+        "security_classification", "chunk_index", "text", "display_text", "score",
     }
+
+
+def test_document_metadata_attached_for_the_chat_ui_source_panel(monkeypatch):
+    """Chat UI redesign — the source panel shows department/document type/
+    security level for a citation. That's document-level metadata, not
+    chunk content, so it's safe to attach once the chunk itself already
+    passed every RBAC/department filter (this function's own job, above)."""
+    monkeypatch.setattr(settings, "parent_child_retrieval_enabled", False)
+    hit = _hit()
+    monkeypatch.setattr(retrieval_agent, "search_with_reranking", lambda db, **k: ([hit], True))
+    meta_row = SimpleNamespace(
+        id=hit.document_id, filename="quality_report.pdf", department="manufacturing",
+        document_type="report", security_classification="internal",
+    )
+
+    results = retrieval_agent.search_documents(_FakeDb(doc_meta_rows=[meta_row]), query="q")
+
+    assert results[0]["document_filename"] == "quality_report.pdf"
+    assert results[0]["document_department"] == "manufacturing"
+    assert results[0]["document_type"] == "report"
+    assert results[0]["security_classification"] == "internal"
+
+
+def test_document_metadata_is_none_when_document_row_missing(monkeypatch):
+    """A document row could be missing (deleted between index and query) —
+    must degrade to None fields, not KeyError/AttributeError."""
+    monkeypatch.setattr(settings, "parent_child_retrieval_enabled", False)
+    monkeypatch.setattr(retrieval_agent, "search_with_reranking", lambda db, **k: ([_hit()], True))
+
+    results = retrieval_agent.search_documents(_FakeDb(doc_meta_rows=[]), query="q")
+
+    assert results[0]["document_filename"] is None
+    assert results[0]["document_department"] is None
+    assert results[0]["document_type"] is None
+    assert results[0]["security_classification"] is None
 
 
 def test_empty_hits_returns_empty_list_regardless_of_flag(monkeypatch):

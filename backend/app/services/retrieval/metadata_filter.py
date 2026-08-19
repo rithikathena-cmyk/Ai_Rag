@@ -55,7 +55,7 @@ def resolve_document_ids(
 
     if user_id is None:
         return base_ids
-    return filter_by_permission(db, base_ids, user_id)
+    return filter_by_permission(db, base_ids, user_id, role)
 
 
 def build_qdrant_filter(document_ids: list[uuid.UUID] | None) -> Filter | None:

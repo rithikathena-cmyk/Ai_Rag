@@ -134,9 +134,15 @@ def test_output_presidio_pass_still_runs_deterministic_pii_redaction_after(monke
     # redacts this, unaffected by presidio_check's pass verdict.
     assert result.blocked is False
     assert "jane@example.com" not in result.text
+    # EMAIL's safe default output action is REDACT — a full opaque
+    # replacement, not a partial mask (see services/guardrail_policy/
+    # pii_policy.py's _SAFE_PII_DEFAULTS and pii.py's _resolve_match()).
     assert "[REDACTED_EMAIL]" in result.text
     step_names = [s.name for s in result.steps]
-    assert step_names == ["system_prompt_leak_check", "toxicity_check", "presidio_check", "gliner_check", "pii_redact"]
+    assert step_names == [
+        "prompt_injection_check", "system_prompt_leak_check", "toxicity_check", "presidio_check",
+        "gliner_check", "pii_redact",
+    ]
 
 
 def test_output_presidio_infra_failure_fails_closed_by_default(monkeypatch):

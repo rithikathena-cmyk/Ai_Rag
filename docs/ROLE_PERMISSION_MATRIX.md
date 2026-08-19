@@ -77,9 +77,47 @@ same as HR. Approval required for: `delete_documents` (see `docs/AUDIT_LOGGING.m
 Model: **Dynamic** — Sonnet default, Opus for the union of every other role's escalation triggers.
 Knowledge departments: all four. Tools: all three, unrestricted SQL table allowlist. Permissions:
 `*` (unlimited). Quotas: unlimited except 10 concurrent requests (a resource-protection ceiling, not
-a policy restriction). Plus everything already gated by `require_role(Role.ADMIN)` today: `/admin/*`
-(Qdrant collection management, metrics, gateway usage, guardrail analytics), user/role management
-(`GET /users`, `PATCH /users/{id}`).
+a policy restriction). Plus the `/admin/*` settings routes (Qdrant collection management,
+model availability) and user/role management (`GET /users`, `PATCH /users/{id}`).
+
+`/admin/*` is **not** one blanket `require_role(Role.ADMIN)` gate — `routers/admin.py` splits it
+three ways by permission, and the analytics group is no longer Admin-only at all:
+
+| Route group | Gate | Who reaches it |
+| --- | --- | --- |
+| `/admin/collections` (GET/POST/DELETE), `/admin/index-consistency`, `/admin/model-availability` (GET/PUT) | `SYSTEM_SETTINGS` | Admin only |
+| `/admin/metrics`, `/admin/query-metrics`, `/admin/gateway-usage`, `/admin/guardrail-analytics` | `VIEW_ANALYTICS` | **every role** |
+| `/admin/roles` | `VIEW_ROLES` | roles holding `VIEW_ROLES` |
+
+## Coarse permission catalog (`rbac_permissions`)
+
+Separate from the capability actions tabled above: `core/permissions.py`'s `Permission` enum answers
+"can this role reach this feature at all" (nav visibility + endpoint 403s), granted per role via
+`llm_rbac.yaml`'s `rbac_permissions` key. The one entry worth calling out here is `VIEW_ANALYTICS`,
+which **every role holds** — the read-only Metrics dashboards (latency/tokens, retrieval, gateway
+cost in USD, guardrail pass/redact/block counts) are deliberately org-wide, not an admin surface.
+
+Two consequences that are easy to get wrong:
+
+- **Raw guardrail detail is still restricted.** `pipeline.py::_record()` stores each step's `detail`
+  verbatim, and those strings embed classifier internals (`best score=0.50`, `Classified as SAFE
+  (score=1.00)`, the literal configured scope topics) that the chat UI deliberately hides from
+  non-privileged users. `get_guardrail_analytics()` therefore replaces `detail` with
+  `"Details restricted"` for callers without `VIEW_AUDIT_LOGS` (CEO/Admin only). Counts, direction,
+  check name, and action stay visible to everyone, so the dashboard is fully usable either way.
+- **The four `POLICY_*` permissions gate the Policy Copilot**, and are held by
+  **CEO and Admin only**: `POLICY_READ`, `POLICY_SIMULATE`, `POLICY_PROPOSE`,
+  `POLICY_APPROVE`. Deliberately split rather than reusing
+  `MANAGE_GUARDRAIL_POLICIES` for everything — proposing a change and approving
+  one are different authorities, and a deployment wanting four-eyes review needs
+  to grant `POLICY_PROPOSE` without `POLICY_APPROVE`, which a single combined
+  permission cannot express. All four are currently granted together, so CEO's
+  and Admin's effective authority is unchanged. Verified live: Employee, HR and
+  Project Manager receive 403 from every `/policy-copilot/*` endpoint.
+- **`VIEW_ANALYTICS` is necessary but not sufficient for `/evaluation`.** `routers/evaluation.py`
+  enforces a stricter `require_role(ADMIN, CEO, PROJECT_MANAGER)`, so HR and Employee hold the
+  permission but must not be shown the link — `components/layout/nav.ts` denies both by role via
+  `denyRoles`, mirrored on the route by `ProtectedRoute`.
 
 ## Extension point — closed
 

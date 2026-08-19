@@ -61,7 +61,16 @@ def test_scope_semantic_block_verdict_blocks_the_whole_pipeline(monkeypatch):
     result = pipeline.run_input_guardrails("what's the weather like today")
 
     assert result.blocked is True
-    assert result.block_reason == "That's outside what I can help with here."
+    # Wording now comes from response_generator.py's centralized _TEMPLATES
+    # (the "semantic_scope" reason) rather than a message hardcoded per
+    # check — this test predates that refactor. Same wording scope.py's
+    # keyword-match block uses (_TEMPLATES["scope_keyword"]), intentionally:
+    # both reasons read as the same generic "out of scope" outcome to the
+    # user regardless of which of the two scope checks caught it.
+    assert result.block_reason == (
+        "That request is outside the enterprise knowledge scope this assistant supports. "
+        "I can help with questions related to the enterprise knowledge base."
+    )
 
 
 def test_scope_semantic_check_not_wired_into_output_pipeline():

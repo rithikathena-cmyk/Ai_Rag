@@ -5,6 +5,16 @@ authentication, authorization, tool-level protection, and what's explicitly not 
 Cross-references `CLAUDE_GATEWAY_ARCHITECTURE.md` and `GUARDRAILS_ARCHITECTURE.md`, which cover the
 mechanisms this document assembles into a security model.
 
+> **Correction (added during the multi-agent guardrails orchestration audit):** §1 and §3 below
+> describe a pre-RBAC/JWT snapshot of this app (predates commit `adf63e2`, "Add RBAC/JWT auth, Claude
+> gateway, guardrails, and project-scoped access control") and are **out of date**. `/chat`, `/search`,
+> and `/documents/*` are gated behind `get_current_user` today (`routers/chat.py`'s
+> `current_user: UserModel = Depends(get_current_user)`, verified live and via
+> `backend/tests/integration/test_live_chat_flow.py`), and `services/guardrails/
+> retrieval_permissions.py` filters using the *verified* JWT-authenticated user's ID, not a
+> client-supplied one. The "real gap to close" language in §1/§3 has been closed; treat the rest of
+> this file as historical unless it's been reconciled since.
+
 ## 1. Identity
 
 `services/auth/` (built in the prior increment): password hashing (PBKDF2-HMAC-SHA256, 390k

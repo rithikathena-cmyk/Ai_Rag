@@ -121,8 +121,18 @@ def generate_report(
 
     _WRITERS[fmt](path, title, columns, rows)
 
+    # .resolve(), not str(path) directly: settings.report_dir is supposed to
+    # always be absolute (see its default in config.py), but if it's ever
+    # misconfigured to a relative value (an env var override, a different
+    # launch cwd, ...) a bare relative string stored here becomes
+    # unresolvable the moment a *different* process launches the app from a
+    # different working directory — routers/reports.py's FileResponse
+    # resolves file_path against whatever cwd that later process happens to
+    # have, not the one this report was generated under. Storing the
+    # resolved absolute path makes the stored reference immune to that,
+    # regardless of what report_dir was configured as at generation time.
     row_model = ReportModel(
-        id=report_id, title=title, format=fmt, file_path=str(path), row_count=len(rows),
+        id=report_id, title=title, format=fmt, file_path=str(path.resolve()), row_count=len(rows),
         owner_id=owner_id, department=department,
     )
     db.add(row_model)

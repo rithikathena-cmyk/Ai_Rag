@@ -72,7 +72,24 @@ def test_read_routes_reuse_filter_by_category_for_department_visibility():
         documents.get_document_versions, documents.get_document_entities,
     ):
         source = inspect.getsource(route)
-        assert "filter_by_category" in source or "knowledge_departments_for" in source
+        # The five single-document GET routes now go through the shared
+        # _document_is_visible() helper (department AND per-user-grant/
+        # security_classification visibility, not just department) instead
+        # of calling filter_by_category directly — list_documents still
+        # calls both filter_by_category and filter_by_permission inline.
+        # See _document_is_visible()'s own docstring for why a single check
+        # replaced the two-line pattern every one of these used to repeat.
+        assert (
+            "filter_by_category" in source
+            or "knowledge_departments_for" in source
+            or "_document_is_visible" in source
+        )
+
+
+def test_document_is_visible_checks_both_category_and_permission_rails():
+    source = inspect.getsource(documents._document_is_visible)
+    assert "filter_by_category" in source
+    assert "filter_by_permission" in source
 
 
 # ------------------------------------------------------- coarse require_permission gates
