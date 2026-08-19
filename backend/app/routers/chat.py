@@ -299,6 +299,27 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: User
         raise
     access_step = _access_trace_step(decision.role, decision.department)
 
+    # NEW: Guardrails Engine - Multi-rail protection
+    from app.services.guardrails.engine import GuardrailsEngine, Surface
+    guardrails_engine = GuardrailsEngine()
+
+    # Evaluate input through guardrails
+    input_eval = guardrails_engine.evaluate_input(
+        request.message,
+        current_user,
+        Surface.USER_PROMPT
+    )
+
+    if input_eval.should_block:
+        raise AppError(
+            400,
+            "guardrail_block_input",
+            f"Your request was blocked by guardrails: {input_eval.block_reason}"
+        )
+
+    # Use redacted text if guardrails modified it
+    message_to_process = input_eval.text_after_redaction or request.message
+
     # Guardrail-block escalation gate — a user who has accumulated enough
     # recent guardrail blocks (services/guardrails/escalation.py) is turned
     # away here, before conversation lookup/creation or any guardrail check
